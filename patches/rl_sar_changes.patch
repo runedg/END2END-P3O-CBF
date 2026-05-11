@@ -1,0 +1,814 @@
+diff --git a/src/rl_sar/CMakeLists.txt b/src/rl_sar/CMakeLists.txt
+index b3995fe..c975d0f 100644
+--- a/src/rl_sar/CMakeLists.txt
++++ b/src/rl_sar/CMakeLists.txt
+@@ -78,6 +78,7 @@ if(NOT USE_CMAKE)
+         find_package(robot_joint_controller REQUIRED)
+         find_package(rclpy REQUIRED)
+         find_package(gazebo_msgs REQUIRED)
++        find_package(livox_ros_driver2 REQUIRED)
+         find_package(std_srvs REQUIRED)
+         find_package(geometry_msgs REQUIRED)
+         ament_package()
+@@ -438,6 +439,7 @@ if(NOT USE_CMAKE)
+             gazebo_msgs
+             std_srvs
+             geometry_msgs
++            livox_ros_driver2
+         )
+         install(TARGETS rl_sim DESTINATION lib/${PROJECT_NAME})
+     endif()
+diff --git a/src/rl_sar/fsm_robot/fsm_g1.hpp b/src/rl_sar/fsm_robot/fsm_g1.hpp
+index c41bf6f..146c9c2 100644
+--- a/src/rl_sar/fsm_robot/fsm_g1.hpp
++++ b/src/rl_sar/fsm_robot/fsm_g1.hpp
+@@ -79,6 +79,10 @@ public:
+             {
+                 return "RLFSMStateRLRoboMimicLocomotion";
+             }
++            else if (rl.control.current_keyboard == Input::Keyboard::Num5 || rl.control.current_gamepad == Input::Gamepad::LB_DPadUp)
++            {
++                return "RLFSMStateRLP3OEnd2End";
++            }
+             else if (rl.control.current_keyboard == Input::Keyboard::Num9 || rl.control.current_gamepad == Input::Gamepad::B)
+             {
+                 return "RLFSMStateGetDown";
+@@ -196,6 +200,10 @@ RLFSMStateRLRoboMimicLocomotion(RL *rl) : RLFSMState(*rl, "RLFSMStateRLRoboMimic
+         {
+             return "RLFSMStateRLWholeBodyTrackingGangnamStyle";
+         }
++        else if (rl.control.current_keyboard == Input::Keyboard::Num5 || rl.control.current_gamepad == Input::Gamepad::LB_DPadUp)
++        {
++            return "RLFSMStateRLP3OEnd2End";
++        }
+         return state_name_;
+     }
+ };
+@@ -461,6 +469,73 @@ RLFSMStateRLWholeBodyTrackingGangnamStyle(RL *rl) : RLFSMState(*rl, "RLFSMStateR
+     }
+ };
+ 
++class RLFSMStateRLP3OEnd2End : public RLFSMState
++{
++public:
++    RLFSMStateRLP3OEnd2End(RL *rl) : RLFSMState(*rl, "RLFSMStateRLP3OEnd2End") {}
++
++    void Enter() override
++    {
++        rl.episode_length_buf = 0;
++
++        rl.config_name = "p3o_end2end";
++        std::string robot_config_path = rl.robot_name + "/" + rl.config_name;
++        try
++        {
++            rl.InitRL(robot_config_path);
++            rl.now_state = *fsm_state;
++        }
++        catch (const std::exception& e)
++        {
++            std::cout << LOGGER::ERROR << "InitRL() failed: " << e.what() << std::endl;
++            rl.rl_init_done = false;
++            rl.fsm.RequestStateChange("RLFSMStatePassive");
++        }
++    }
++
++    void Run() override
++    {
++        if (!rl.rl_init_done) rl.rl_init_done = true;
++
++        std::cout << "\r\033[K" << std::flush << LOGGER::INFO << "RL Controller [" << rl.config_name << "] x:" << rl.control.x << " y:" << rl.control.y << " yaw:" << rl.control.yaw << std::flush;
++        RLControl();
++    }
++
++    void Exit() override
++    {
++        rl.rl_init_done = false;
++    }
++
++    std::string CheckChange() override
++    {
++        if (rl.control.current_keyboard == Input::Keyboard::P || rl.control.current_gamepad == Input::Gamepad::LB_X)
++        {
++            return "RLFSMStatePassive";
++        }
++        else if (rl.control.current_keyboard == Input::Keyboard::Num9 || rl.control.current_gamepad == Input::Gamepad::B)
++        {
++            return "RLFSMStateGetDown";
++        }
++        else if (rl.control.current_keyboard == Input::Keyboard::Num0 || rl.control.current_gamepad == Input::Gamepad::A)
++        {
++            return "RLFSMStateGetUp";
++        }
++        else if (rl.control.current_keyboard == Input::Keyboard::Num5 || rl.control.current_gamepad == Input::Gamepad::LB_DPadUp)
++        {
++            return "RLFSMStateRLP3OEnd2End";
++        }
++        else if (rl.control.current_keyboard == Input::Keyboard::Num1 || rl.control.current_gamepad == Input::Gamepad::RB_DPadUp)
++        {
++            return "RLFSMStateRLRoboMimicLocomotion";
++        }
++        else if (rl.control.current_keyboard == Input::Keyboard::Num5 || rl.control.current_gamepad == Input::Gamepad::LB_DPadUp)
++        {
++            return "RLFSMStateRLP3OEnd2End";
++        }
++        return state_name_;
++    }
++};
++
+ } // namespace g1_fsm
+ 
+ class G1FSMFactory : public FSMFactory
+@@ -484,6 +559,8 @@ public:
+             return std::make_shared<g1_fsm::RLFSMStateRLWholeBodyTrackingDance102>(rl);
+         else if (state_name == "RLFSMStateRLWholeBodyTrackingGangnamStyle")
+             return std::make_shared<g1_fsm::RLFSMStateRLWholeBodyTrackingGangnamStyle>(rl);
++        else if (state_name == "RLFSMStateRLP3OEnd2End")
++            return std::make_shared<g1_fsm::RLFSMStateRLP3OEnd2End>(rl);
+         return nullptr;
+     }
+     std::string GetType() const override { return "g1"; }
+@@ -496,7 +573,8 @@ public:
+             "RLFSMStateRLRoboMimicLocomotion",
+             "RLFSMStateRLRoboMimicCharleston",
+             "RLFSMStateRLWholeBodyTrackingDance102",
+-            "RLFSMStateRLWholeBodyTrackingGangnamStyle"
++            "RLFSMStateRLWholeBodyTrackingGangnamStyle",
++            "RLFSMStateRLP3OEnd2End"
+         };
+     }
+     std::string GetInitialState() const override { return initial_state_; }
+diff --git a/src/rl_sar/include/rl_sim.hpp b/src/rl_sar/include/rl_sim.hpp
+index 7b71e36..d0da442 100644
+--- a/src/rl_sar/include/rl_sim.hpp
++++ b/src/rl_sar/include/rl_sim.hpp
+@@ -39,6 +39,9 @@
+ #include <rclcpp/rclcpp.hpp>
+ #include <sensor_msgs/msg/joint_state.hpp>
+ #include <sensor_msgs/msg/imu.hpp>
++#include <sensor_msgs/msg/point_cloud2.hpp>
++#include <livox_ros_driver2/msg/custom_msg.hpp>
++#include <livox_ros_driver2/msg/custom_point.hpp>
+ #include <sensor_msgs/msg/joy.hpp>
+ #include <geometry_msgs/msg/twist.hpp>
+ #include <std_srvs/srv/empty.hpp>
+@@ -105,6 +108,7 @@ private:
+     robot_msgs::msg::RobotCommand robot_command_publisher_msg;
+     robot_msgs::msg::RobotState robot_state_subscriber_msg;
+     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr gazebo_imu_subscriber;
++    rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr lidar_subscriber;
+     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_subscriber;
+     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_subscriber;
+     rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr joy_subscriber;
+@@ -115,6 +119,7 @@ private:
+     rclcpp::Subscription<robot_msgs::msg::RobotState>::SharedPtr robot_state_subscriber;
+     rclcpp::Client<rcl_interfaces::srv::GetParameters>::SharedPtr param_client;
+     void GazeboImuCallback(const sensor_msgs::msg::Imu::SharedPtr msg);
++    void LidarCallback(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg);
+     void CmdvelCallback(const geometry_msgs::msg::Twist::SharedPtr msg);
+     void RobotStateCallback(const robot_msgs::msg::RobotState::SharedPtr msg);
+     void JoyCallback(const sensor_msgs::msg::Joy::SharedPtr msg);
+@@ -126,6 +131,16 @@ private:
+     std::map<std::string, float> joint_velocities;
+     std::map<std::string, float> joint_efforts;
+     void StartJointController(const std::string& ros_namespace, const std::vector<std::string>& names);
++
++    // lidar
++    struct LidarRay { float theta; float phi; };
++    struct LidarPoint3 { float x; float y; float z; };
++    std::vector<LidarRay> mid360_rays;
++    std::vector<LidarPoint3> latest_lidar_points_base;
++    std::mutex lidar_mutex;
++    bool lidar_received = false;
++    std::vector<LidarPoint3> FpsSampleLidar(const std::vector<LidarPoint3>& points, const std::vector<bool>& valid, int num_samples);
++    void LoadMid360Pattern();
+ };
+ 
+ #endif // RL_SIM_HPP
+diff --git a/src/rl_sar/include/rl_sim_mujoco.hpp b/src/rl_sar/include/rl_sim_mujoco.hpp
+index 126deb3..0458950 100644
+--- a/src/rl_sar/include/rl_sim_mujoco.hpp
++++ b/src/rl_sar/include/rl_sim_mujoco.hpp
+@@ -64,6 +64,7 @@ private:
+     std::vector<float> Forward() override;
+     void GetState(RobotState<float> *state) override;
+     void SetCommand(const RobotCommand<float> *command) override;
++    bool SupportsLidarPoints() const override { return true; }
+     void RunModel();
+     void RobotControl();
+ 
+diff --git a/src/rl_sar/launch/gazebo.launch.py b/src/rl_sar/launch/gazebo.launch.py
+index 62c535a..b7e7851 100644
+--- a/src/rl_sar/launch/gazebo.launch.py
++++ b/src/rl_sar/launch/gazebo.launch.py
+@@ -3,7 +3,7 @@
+ 
+ import os
+ from launch import LaunchDescription
+-from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
++from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, SetEnvironmentVariable
+ from launch.launch_description_sources import PythonLaunchDescriptionSource
+ from launch.substitutions import LaunchConfiguration, TextSubstitution, Command
+ from launch_ros.actions import Node
+@@ -13,8 +13,11 @@ from ament_index_python.packages import get_package_share_directory
+ 
+ def generate_launch_description():
+     rname = LaunchConfiguration("rname")
++    world_name = LaunchConfiguration("world")
++
++    # Force Gazebo to use loopback to avoid network interface permission errors
++    set_gazebo_ip = SetEnvironmentVariable("GAZEBO_IP", "127.0.0.1")
+ 
+-    wname = "stairs"
+     robot_name = ParameterValue(Command(["echo -n ", rname]), value_type=str)
+     ros_namespace = ParameterValue(Command(["echo -n ", "/", rname, "_gazebo"]), value_type=str)
+     gazebo_model_name = ParameterValue(Command(["echo -n ", rname, "_gazebo"]), value_type=str)
+@@ -41,9 +44,7 @@ def generate_launch_description():
+             os.path.join(get_package_share_directory("gazebo_ros"), "launch", "gazebo.launch.py")
+         ),
+         launch_arguments={
+-            # "verbose": "true",
+-            # "pause": "true",  # Not Available
+-            "world": os.path.join(get_package_share_directory("rl_sar"), "worlds", wname + ".world"),
++            "world": world_name,
+         }.items(),
+     )
+ 
+@@ -94,11 +95,19 @@ def generate_launch_description():
+     )
+ 
+     return LaunchDescription([
++        set_gazebo_ip,
+         DeclareLaunchArgument(
+             "rname",
+-            description="Robot name (e.g., a1, go2)",
++            description="Robot name (e.g., a1, go2, g1)",
+             default_value=TextSubstitution(text=""),
+         ),
++        DeclareLaunchArgument(
++            "world",
++            description="Gazebo world file (full path)",
++            default_value=TextSubstitution(
++                text=os.path.join(get_package_share_directory("rl_sar"), "worlds", "obstacles.world")
++            ),
++        ),
+         robot_state_publisher_node,
+         gazebo,
+         spawn_entity,
+diff --git a/src/rl_sar/library/core/rl_sdk/rl_sdk.cpp b/src/rl_sar/library/core/rl_sdk/rl_sdk.cpp
+index 4969a6f..d9f7f83 100644
+--- a/src/rl_sar/library/core/rl_sdk/rl_sdk.cpp
++++ b/src/rl_sar/library/core/rl_sdk/rl_sdk.cpp
+@@ -157,6 +157,24 @@ std::vector<float> RL::ComputeObservation()
+             }
+             obs_list.push_back(anchor_ori);
+         }
++        else if (observation == "lidar_points")
++        {
++            int num_points = this->params.Get<int>("lidar_num_points", 0);
++            float scale = this->params.Get<float>("lidar_points_scale", 1.0f);
++            float clip = this->params.Get<float>("lidar_points_clip", 6.0f);
++            if (num_points > 0 && this->SupportsLidarPoints())
++            {
++                std::vector<float> lp = this->obs.lidar_points;
++                if (lp.empty()) lp.resize(num_points * 3, 0.0f);
++                for (auto& v : lp) v = std::max(-clip, std::min(clip, v * scale));
++                obs_list.push_back(lp);
++            }
++            else
++            {
++                std::vector<float> lp(num_points * 3, 0.0f);
++                obs_list.push_back(lp);
++            }
++        }
+         else if (observation == "RoboMimic_Deploy/phase")
+         {
+             float motion_time = this->episode_length_buf * this->params.Get<float>("dt") * this->params.Get<int>("decimation");
+@@ -194,6 +212,8 @@ void RL::InitObservations()
+     this->obs.dof_vel.resize(this->params.Get<int>("num_of_dofs"), 0.0f);
+     this->obs.actions.clear();
+     this->obs.actions.resize(this->params.Get<int>("num_of_dofs"), 0.0f);
++    this->obs.lidar_points.clear();
++    this->obs.lidar_points.resize(this->params.Get<int>("lidar_num_points", 0) * 3, 0.0f);
+     this->ComputeObservation();
+ }
+ 
+diff --git a/src/rl_sar/library/core/rl_sdk/rl_sdk.hpp b/src/rl_sar/library/core/rl_sdk/rl_sdk.hpp
+index 1945a3e..b94b90a 100644
+--- a/src/rl_sar/library/core/rl_sdk/rl_sdk.hpp
++++ b/src/rl_sar/library/core/rl_sdk/rl_sdk.hpp
+@@ -180,6 +180,7 @@ struct Observations
+     std::vector<T> dof_pos;
+     std::vector<T> dof_vel;
+     std::vector<T> actions;
++    std::vector<T> lidar_points;
+ };
+ 
+ class RL
+@@ -215,6 +216,7 @@ public:
+     std::vector<float> ComputeObservation();
+     virtual void GetState(RobotState<float> *state) = 0;
+     virtual void SetCommand(const RobotCommand<float> *command) = 0;
++    virtual bool SupportsLidarPoints() const { return false; }
+     void StateController(const RobotState<float> *state, RobotCommand<float> *command);
+     void ComputeOutput(const std::vector<float> &actions, std::vector<float> &output_dof_pos, std::vector<float> &output_dof_vel, std::vector<float> &output_dof_tau);
+ 
+diff --git a/src/rl_sar/src/rl_sim.cpp b/src/rl_sar/src/rl_sim.cpp
+index 33fc31a..55c287a 100644
+--- a/src/rl_sar/src/rl_sim.cpp
++++ b/src/rl_sar/src/rl_sim.cpp
+@@ -5,6 +5,11 @@
+ 
+ #include "rl_sim.hpp"
+ 
++#include <limits>
++#include <sstream>
++#include <array>
++#include <cmath>
++
+ RL_Sim::RL_Sim(int argc, char **argv)
+ {
+ #if defined(USE_ROS1)
+@@ -135,6 +140,10 @@ RL_Sim::RL_Sim(int argc, char **argv)
+     this->gazebo_imu_subscriber = ros2_node->create_subscription<sensor_msgs::msg::Imu>(
+         "/imu", rclcpp::SystemDefaultsQoS(), [this] (const sensor_msgs::msg::Imu::SharedPtr msg) {this->GazeboImuCallback(msg);}
+     );
++    this->lidar_subscriber = ros2_node->create_subscription<livox_ros_driver2::msg::CustomMsg>(
++        "/mid360", rclcpp::SensorDataQoS(), [this] (const livox_ros_driver2::msg::CustomMsg::SharedPtr msg) {this->LidarCallback(msg);}
++    );
++    this->LoadMid360Pattern();
+     this->robot_state_subscriber = ros2_node->create_subscription<robot_msgs::msg::RobotState>(
+         this->ros_namespace + "robot_joint_controller/state", rclcpp::SystemDefaultsQoS(),
+         [this] (const robot_msgs::msg::RobotState::SharedPtr msg) {this->RobotStateCallback(msg);}
+@@ -455,6 +464,175 @@ void RL_Sim::RobotStateCallback(const robot_msgs::msg::RobotState::SharedPtr msg
+ }
+ #endif
+ 
++// ==================== Lidar Functions ====================
++
++void RL_Sim::LoadMid360Pattern()
++{
++    this->mid360_rays.clear();
++    std::string pattern_path = std::string(POLICY_DIR) + "/g1/p3o_end2end/mid360_pattern_1024.csv";
++    std::ifstream file(pattern_path);
++    if (!file.is_open())
++    {
++        std::cout << LOGGER::WARNING << "Mid360 pattern file not found: " << pattern_path << " (lidar will output zeros)" << std::endl;
++        return;
++    }
++    std::string line;
++    while (std::getline(file, line))
++    {
++        std::stringstream ss(line);
++        std::string theta_str, phi_str;
++        if (std::getline(ss, theta_str, ',') && std::getline(ss, phi_str, ','))
++        {
++            this->mid360_rays.push_back({std::stof(theta_str), std::stof(phi_str)});
++        }
++    }
++    std::cout << LOGGER::INFO << "Loaded mid360 pattern: " << this->mid360_rays.size() << " rays" << std::endl;
++}
++
++void RL_Sim::LidarCallback(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg)
++{
++    if (this->mid360_rays.empty()) return;
++
++    // sensor offset relative to pelvis (same as URDF mid360_link)
++    const float sensor_offset[3] = {0.10f, 0.0f, 0.63f};
++    const float max_distance = this->params.Get<float>("lidar_points_clip", 6.0f);
++    const float half_fov = static_cast<float>(M_PI) * 0.5f;
++
++    // build unordered point cloud from livox custom msg
++    // each point has (x,y,z) in sensor frame
++    std::vector<std::array<float,3>> raw_points;
++    raw_points.reserve(msg->point_num);
++    for (const auto& pt : msg->points)
++    {
++        raw_points.push_back({pt.x, pt.y, pt.z});
++    }
++
++    // match each mid360_ray to the closest raw point by direction
++    // then transform to body frame (relative to pelvis)
++    std::vector<LidarPoint3> points_base;
++    std::vector<bool> valid;
++    points_base.reserve(this->mid360_rays.size());
++    valid.reserve(this->mid360_rays.size());
++
++    for (const auto& ray : this->mid360_rays)
++    {
++        // ray direction in sensor frame (same convention as mujoco version)
++        float dir[3] = {
++            std::cos(ray.theta) * std::cos(ray.phi),
++            std::sin(ray.theta) * std::cos(ray.phi),
++            std::sin(ray.phi)
++        };
++
++        // find closest raw point by angular distance
++        float best_dist = max_distance;
++        float best_dot = -1.0f;
++        for (const auto& rp : raw_points)
++        {
++            float r_norm = std::sqrt(rp[0]*rp[0] + rp[1]*rp[1] + rp[2]*rp[2]);
++            if (r_norm < 0.01f) continue;
++            float dot = (dir[0]*rp[0] + dir[1]*rp[1] + dir[2]*rp[2]) / r_norm;
++            if (dot > best_dot)
++            {
++                best_dot = dot;
++                best_dist = r_norm;
++            }
++        }
++        best_dist = std::min(best_dist, max_distance);
++
++        // point in body frame (relative to pelvis, offset from sensor to pelvis)
++        LidarPoint3 pb = {
++            dir[0] * best_dist + sensor_offset[0],
++            dir[1] * best_dist + sensor_offset[1],
++            dir[2] * best_dist + sensor_offset[2]
++        };
++
++        float planar_range = std::sqrt(std::max(pb.x * pb.x + pb.y * pb.y, 1.0e-9f));
++        float theta = std::atan2(pb.y, pb.x);
++        bool point_valid =
++            pb.x >= -0.5f && pb.x <= 6.0f &&
++            std::abs(pb.y) <= 3.0f &&
++            pb.z >= -1.0f && pb.z <= 0.8f &&
++            planar_range >= 0.2f && planar_range <= max_distance &&
++            std::abs(theta) <= half_fov;
++
++        points_base.push_back(pb);
++        valid.push_back(point_valid);
++    }
++
++    // FPS sample down to num_points
++    int num_points = this->params.Get<int>("lidar_num_points", 128);
++    auto sampled = this->FpsSampleLidar(points_base, valid, num_points);
++
++    {
++        std::lock_guard<std::mutex> lock(this->lidar_mutex);
++        this->latest_lidar_points_base = std::move(sampled);
++        this->lidar_received = true;
++    }
++}
++
++std::vector<RL_Sim::LidarPoint3> RL_Sim::FpsSampleLidar(const std::vector<LidarPoint3>& points, const std::vector<bool>& valid, int num_samples)
++{
++    std::vector<LidarPoint3> sampled(num_samples, {0.0f, 0.0f, 0.0f});
++    int valid_count = 0;
++    for (bool is_valid : valid) { if (is_valid) valid_count++; }
++    if (points.empty() || valid_count == 0 || num_samples <= 0) return sampled;
++
++    // find seed: closest valid point
++    float best_range = std::numeric_limits<float>::infinity();
++    int current_idx = 0;
++    for (size_t i = 0; i < points.size(); ++i)
++    {
++        if (!valid[i]) continue;
++        float range_sq = points[i].x * points[i].x + points[i].y * points[i].y + points[i].z * points[i].z;
++        if (range_sq < best_range)
++        {
++            best_range = range_sq;
++            current_idx = static_cast<int>(i);
++        }
++    }
++
++    // greedy FPS
++    std::vector<float> min_dist(points.size(), std::numeric_limits<float>::infinity());
++    std::vector<int> selected;
++    selected.reserve(num_samples);
++
++    for (int s = 0; s < num_samples; ++s)
++    {
++        if (s < static_cast<int>(selected.size()) || s == 0)
++        {
++            selected.push_back(current_idx);
++            sampled[s] = points[current_idx];
++        }
++
++        float cx = points[current_idx].x, cy = points[current_idx].y, cz = points[current_idx].z;
++        for (size_t j = 0; j < points.size(); ++j)
++        {
++            if (!valid[j]) continue;
++            float dx = points[j].x - cx, dy = points[j].y - cy, dz = points[j].z - cz;
++            float d2 = dx*dx + dy*dy + dz*dz;
++            if (d2 < min_dist[j]) min_dist[j] = d2;
++        }
++
++        // pick next: valid point with max min_dist
++        float max_min_dist = -1.0f;
++        int next_idx = current_idx;
++        for (size_t j = 0; j < points.size(); ++j)
++        {
++            if (!valid[j]) continue;
++            bool already_selected = false;
++            for (int sel : selected) { if (static_cast<size_t>(sel) == j) { already_selected = true; break; } }
++            if (already_selected) continue;
++            if (min_dist[j] > max_min_dist)
++            {
++                max_min_dist = min_dist[j];
++                next_idx = static_cast<int>(j);
++            }
++        }
++        current_idx = next_idx;
++    }
++    return sampled;
++}
++
+ void RL_Sim::RunModel()
+ {
+     if (this->rl_init_done && simulation_running)
+@@ -470,6 +648,32 @@ void RL_Sim::RunModel()
+         this->obs.dof_pos = this->robot_state.motor_state.q;
+         this->obs.dof_vel = this->robot_state.motor_state.dq;
+ 
++        // fill lidar_points from latest callback data
++        if (this->params.Get<int>("lidar_num_points", 0) > 0)
++        {
++            int num_points = this->params.Get<int>("lidar_num_points", 128);
++            this->obs.lidar_points.resize(num_points * 3);
++            std::lock_guard<std::mutex> lock(this->lidar_mutex);
++            if (this->lidar_received && static_cast<int>(this->latest_lidar_points_base.size()) == num_points)
++            {
++                for (int i = 0; i < num_points; ++i)
++                {
++                    this->obs.lidar_points[3 * i + 0] = this->latest_lidar_points_base[i].x;
++                    this->obs.lidar_points[3 * i + 1] = this->latest_lidar_points_base[i].y;
++                    this->obs.lidar_points[3 * i + 2] = this->latest_lidar_points_base[i].z;
++                }
++            }
++            else
++            {
++                for (int i = 0; i < num_points; ++i)
++                {
++                    this->obs.lidar_points[3 * i + 0] = 0.0f;
++                    this->obs.lidar_points[3 * i + 1] = 0.0f;
++                    this->obs.lidar_points[3 * i + 2] = 0.0f;
++                }
++            }
++        }
++
+         this->obs.actions = this->Forward();
+         this->ComputeOutput(this->obs.actions, this->output_dof_pos, this->output_dof_vel, this->output_dof_tau);
+ 
+diff --git a/src/rl_sar/src/rl_sim_mujoco.cpp b/src/rl_sar/src/rl_sim_mujoco.cpp
+index 32c54de..5738dd0 100644
+--- a/src/rl_sar/src/rl_sim_mujoco.cpp
++++ b/src/rl_sar/src/rl_sim_mujoco.cpp
+@@ -5,8 +5,146 @@
+ 
+ #include "rl_sim_mujoco.hpp"
+ 
++#include <array>
++#include <limits>
++#include <sstream>
++
+ RL_Sim* RL_Sim::instance = nullptr;
+ 
++namespace
++{
++struct Mid360Ray
++{
++    float theta;
++    float phi;
++};
++
++struct Point3
++{
++    float x;
++    float y;
++    float z;
++};
++
++std::vector<Mid360Ray> LoadMid360Pattern()
++{
++    std::vector<Mid360Ray> rays;
++    std::string pattern_path = std::string(POLICY_DIR) + "/g1/p3o_end2end/mid360_pattern_1024.csv";
++    std::ifstream file(pattern_path);
++    if (!file.is_open())
++    {
++        std::cout << LOGGER::ERROR << "Failed to open Mid360 pattern: " << pattern_path << std::endl;
++        return rays;
++    }
++
++    std::string line;
++    while (std::getline(file, line))
++    {
++        std::stringstream ss(line);
++        std::string theta_str, phi_str;
++        if (std::getline(ss, theta_str, ',') && std::getline(ss, phi_str, ','))
++        {
++            rays.push_back({std::stof(theta_str), std::stof(phi_str)});
++        }
++    }
++    return rays;
++}
++
++std::vector<Point3> FpsSamplePointCloud(const std::vector<Point3>& points, const std::vector<bool>& valid, int num_samples)
++{
++    std::vector<Point3> sampled(num_samples, {0.0f, 0.0f, 0.0f});
++    int valid_count = 0;
++    for (bool is_valid : valid)
++    {
++        if (is_valid) valid_count++;
++    }
++    if (points.empty() || valid_count == 0 || num_samples <= 0)
++    {
++        return sampled;
++    }
++
++    float best_range = std::numeric_limits<float>::infinity();
++    int current_idx = 0;
++    for (size_t i = 0; i < points.size(); ++i)
++    {
++        if (!valid[i]) continue;
++        float range_sq = points[i].x * points[i].x + points[i].y * points[i].y + points[i].z * points[i].z;
++        if (range_sq < best_range)
++        {
++            best_range = range_sq;
++            current_idx = static_cast<int>(i);
++        }
++    }
++
++    std::vector<float> min_dist(points.size(), std::numeric_limits<float>::infinity());
++    for (int sample_idx = 0; sample_idx < num_samples; ++sample_idx)
++    {
++        sampled[sample_idx] = sample_idx < valid_count ? points[current_idx] : Point3{0.0f, 0.0f, 0.0f};
++        const Point3& current = points[current_idx];
++
++        float farthest_dist = -1.0f;
++        int farthest_idx = current_idx;
++        for (size_t i = 0; i < points.size(); ++i)
++        {
++            float dx = points[i].x - current.x;
++            float dy = points[i].y - current.y;
++            float dz = points[i].z - current.z;
++            float dist_sq = dx * dx + dy * dy + dz * dz;
++            min_dist[i] = std::min(min_dist[i], dist_sq);
++            float masked_dist = valid[i] ? min_dist[i] : -1.0f;
++            if (masked_dist > farthest_dist)
++            {
++                farthest_dist = masked_dist;
++                farthest_idx = static_cast<int>(i);
++            }
++        }
++        current_idx = farthest_idx;
++    }
++    return sampled;
++}
++
++float RaycastCylinder(const std::vector<float>& origin, const std::vector<float>& dir, const std::array<float, 3>& cylinder, float height, float max_distance)
++{
++    float ox = origin[0];
++    float oy = origin[1];
++    float oz = origin[2];
++    float dx = dir[0];
++    float dy = dir[1];
++    float dz = dir[2];
++    float cx = cylinder[0];
++    float cy = cylinder[1];
++    float radius = cylinder[2];
++
++    float a = dx * dx + dy * dy;
++    float b = 2.0f * ((ox - cx) * dx + (oy - cy) * dy);
++    float c = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy) - radius * radius;
++    float discriminant = b * b - 4.0f * a * c;
++    if (discriminant < 0.0f || a <= 1.0e-8f)
++    {
++        return max_distance;
++    }
++
++    float sqrt_disc = std::sqrt(discriminant);
++    float inv_2a = 1.0f / (2.0f * a);
++    float t1 = (-b - sqrt_disc) * inv_2a;
++    float t2 = (-b + sqrt_disc) * inv_2a;
++    float best = std::numeric_limits<float>::infinity();
++    for (float t : {t1, t2})
++    {
++        float z = oz + t * dz;
++        if (t > 0.0f && z >= 0.0f && z <= height)
++        {
++            best = std::min(best, t);
++        }
++    }
++    if (!std::isfinite(best))
++    {
++        return max_distance;
++    }
++    return std::min(best, max_distance);
++}
++} // namespace
++
+ RL_Sim::RL_Sim(int argc, char **argv)
+ {
+     // Set static instance pointer early for signal handler
+@@ -342,6 +480,112 @@ void RL_Sim::RunModel()
+         this->obs.base_quat = this->robot_state.imu.quaternion;
+         this->obs.dof_pos = this->robot_state.motor_state.q;
+         this->obs.dof_vel = this->robot_state.motor_state.dq;
++        if (this->params.Get<int>("lidar_num_points", 0) > 0)
++        {
++            int num_points = this->params.Get<int>("lidar_num_points", 128);
++            float max_distance = this->params.Get<float>("lidar_points_clip", 6.0f);
++            this->obs.lidar_points.resize(num_points * 3);
++
++            static const std::vector<Mid360Ray> mid360_rays = LoadMid360Pattern();
++            // Collect all p3o_obs_* obstacle cylinders
++            struct CylinderObs { std::array<float,3> pos_radius; float height; };
++            std::vector<CylinderObs> obstacles;
++            for (int gi = 0; gi < this->mj_model->ngeom; ++gi)
++            {
++                const char* gname = mj_id2name(this->mj_model, mjOBJ_GEOM, gi);
++                if (gname && std::string(gname).find("p3o_obs_") == 0)
++                {
++                    const mjtNum *gpos = &this->mj_data->geom_xpos[3 * gi];
++                    const mjtNum *gsize = &this->mj_model->geom_size[3 * gi];
++                    obstacles.push_back({{static_cast<float>(gpos[0]), static_cast<float>(gpos[1]), static_cast<float>(gsize[0])}, static_cast<float>(2.0f * gsize[1])});
++                }
++            }
++            // Fallback: also support legacy single p3o_obstacle name
++            if (obstacles.empty())
++            {
++                int legacy_id = mj_name2id(this->mj_model, mjOBJ_GEOM, "p3o_obstacle");
++                if (legacy_id >= 0)
++                {
++                    const mjtNum *gpos = &this->mj_data->geom_xpos[3 * legacy_id];
++                    const mjtNum *gsize = &this->mj_model->geom_size[3 * legacy_id];
++                    obstacles.push_back({{static_cast<float>(gpos[0]), static_cast<float>(gpos[1]), static_cast<float>(gsize[0])}, static_cast<float>(2.0f * gsize[1])});
++                }
++            }
++            int pelvis_body_id = mj_name2id(this->mj_model, mjOBJ_BODY, "pelvis");
++            if (!obstacles.empty() && pelvis_body_id >= 0 && !mid360_rays.empty())
++            {
++                const mjtNum *base_pos = &this->mj_data->xpos[3 * pelvis_body_id];
++                std::vector<float> sensor_offset = {0.10f, 0.0f, 0.63f};
++                std::vector<float> sensor_offset_world = QuaternionMultiply(
++                    QuaternionMultiply(this->obs.base_quat, {0.0f, sensor_offset[0], sensor_offset[1], sensor_offset[2]}),
++                    QuaternionConjugate(this->obs.base_quat)
++                );
++                std::vector<float> sensor_origin_w = {
++                    static_cast<float>(base_pos[0]) + sensor_offset_world[1],
++                    static_cast<float>(base_pos[1]) + sensor_offset_world[2],
++                    static_cast<float>(base_pos[2]) + sensor_offset_world[3]
++                };
++
++                std::vector<Point3> points_base;
++                std::vector<bool> valid;
++                points_base.reserve(mid360_rays.size());
++                valid.reserve(mid360_rays.size());
++                float half_fov = static_cast<float>(M_PI) * 0.5f;
++                for (const Mid360Ray& ray : mid360_rays)
++                {
++                    std::vector<float> local_dir = {
++                        std::cos(ray.theta) * std::cos(ray.phi),
++                        std::sin(ray.theta) * std::cos(ray.phi),
++                        std::sin(ray.phi)
++                    };
++                    std::vector<float> dir_world_quat = QuaternionMultiply(
++                        QuaternionMultiply(this->obs.base_quat, {0.0f, local_dir[0], local_dir[1], local_dir[2]}),
++                        QuaternionConjugate(this->obs.base_quat)
++                    );
++                    std::vector<float> dir_world = {dir_world_quat[1], dir_world_quat[2], dir_world_quat[3]};
++                    // Raycast against all obstacles, keep closest hit
++                    float hit_distance = max_distance;
++                    for (const auto& obs : obstacles)
++                    {
++                        float d = RaycastCylinder(sensor_origin_w, dir_world, obs.pos_radius, obs.height, max_distance);
++                        hit_distance = std::min(hit_distance, d);
++                    }
++                    Point3 point = {
++                        local_dir[0] * hit_distance + sensor_offset[0],
++                        local_dir[1] * hit_distance + sensor_offset[1],
++                        local_dir[2] * hit_distance + sensor_offset[2]
++                    };
++
++                    float planar_range = std::sqrt(std::max(point.x * point.x + point.y * point.y, 1.0e-9f));
++                    float theta = std::atan2(point.y, point.x);
++                    bool point_valid =
++                        point.x >= -0.5f && point.x <= 6.0f &&
++                        std::abs(point.y) <= 3.0f &&
++                        point.z >= -1.0f && point.z <= 0.8f &&
++                        planar_range >= 0.2f && planar_range <= max_distance &&
++                        std::abs(theta) <= half_fov;
++                    points_base.push_back(point);
++                    valid.push_back(point_valid);
++                }
++
++                std::vector<Point3> sampled = FpsSamplePointCloud(points_base, valid, num_points);
++                for (int i = 0; i < num_points; ++i)
++                {
++                    this->obs.lidar_points[3 * i + 0] = sampled[i].x;
++                    this->obs.lidar_points[3 * i + 1] = sampled[i].y;
++                    this->obs.lidar_points[3 * i + 2] = sampled[i].z;
++                }
++            }
++            else
++            {
++                for (int i = 0; i < num_points; ++i)
++                {
++                    this->obs.lidar_points[3 * i + 0] = 0.0f;
++                    this->obs.lidar_points[3 * i + 1] = 0.0f;
++                    this->obs.lidar_points[3 * i + 2] = 0.0f;
++                }
++            }
++        }
+ 
+         this->obs.actions = this->Forward();
+         this->ComputeOutput(this->obs.actions, this->output_dof_pos, this->output_dof_vel, this->output_dof_tau);

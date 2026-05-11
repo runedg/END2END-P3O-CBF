@@ -1,0 +1,7 @@
+ rsl_rl/algorithms/__init__.py     |  3 +-
+ rsl_rl/algorithms/ppo.py          |  8 ++++-
+ rsl_rl/modules/__init__.py        |  2 ++
+ rsl_rl/modules/actor_critic.py    | 20 ++++++++++-
+ rsl_rl/storage/__init__.py        |  3 +-
+ rsl_rl/storage/rollout_storage.py | 75 +++++++++++++++++++++++++++++++++++----
+ 6 files changed, 100 insertions(+), 11 deletions(-)

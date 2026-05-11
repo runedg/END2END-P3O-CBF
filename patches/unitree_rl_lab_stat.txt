@@ -1,0 +1,14 @@
+ deploy/include/FSM/CtrlFSM.h                       |  67 +-
+ deploy/include/param.h                             |  42 +-
+ deploy/robots/g1_29dof/CMakeLists.txt              |  57 +-
+ deploy/robots/g1_29dof/main.cpp                    |   3 +-
+ deploy/robots/g1_29dof/src/State_RLBase.cpp        |  46 +-
+ scripts/rsl_rl/play.py                             |  26 +-
+ .../unitree_rl_lab/assets/robots/unitree.py        |   2 +-
+ .../tasks/locomotion/agents/rsl_rl_ppo_cfg.py      |   3 +-
+ .../tasks/locomotion/mdp/commands/__init__.py      |   3 +-
+ .../tasks/locomotion/mdp/observations.py           | 785 +++++++++++++++++++++
+ .../unitree_rl_lab/tasks/locomotion/mdp/rewards.py | 102 +++
+ .../tasks/locomotion/robots/g1/29dof/__init__.py   |  34 +
+ .../locomotion/robots/g1/29dof/velocity_env_cfg.py |  20 +-
+ 13 files changed, 1142 insertions(+), 48 deletions(-)

@@ -1,0 +1,1453 @@
+diff --git a/deploy/include/FSM/CtrlFSM.h b/deploy/include/FSM/CtrlFSM.h
+index 62aacf2..0f3a2f1 100644
+--- a/deploy/include/FSM/CtrlFSM.h
++++ b/deploy/include/FSM/CtrlFSM.h
+@@ -7,6 +7,7 @@
+ #include "BaseState.h"
+ #include <spdlog/spdlog.h>
+ #include <yaml-cpp/yaml.h>
++#include "param.h"
+ 
+ class CtrlFSM
+ {
+@@ -47,9 +48,51 @@ public:
+ 
+     void start() 
+     {
+-        // Start From State_Passive
+-        currentState = states[0];
++        std::string init_state = "Passive";
++        if (param::config["runtime"] && param::config["runtime"]["auto_start"])
++        {
++            init_state = param::config["runtime"]["auto_start"].as<std::string>();
++        }
++
++        if (states.empty())
++        {
++            throw std::runtime_error("FSM: no states registered");
++        }
++
++        auto pick_state = [&](const std::string& target)->std::shared_ptr<BaseState>
++        {
++            for (auto & state : states)
++            {
++                if (state && state->getStateString() == target)
++                {
++                    return state;
++                }
++            }
++            return nullptr;
++        };
++
++        currentState = pick_state(init_state);
++        if (!currentState)
++        {
++            currentState = pick_state("Passive");
++        }
++        if (!currentState)
++        {
++            for (auto & state : states)
++            {
++                if (state)
++                {
++                    currentState = state;
++                    break;
++                }
++            }
++        }
++        if (!currentState)
++        {
++            throw std::runtime_error("FSM: all registered states are null");
++        }
+         currentState->enter();
++        state_enter_time_ = std::chrono::steady_clock::now();
+ 
+         fsm_thread_ = std::make_shared<unitree::common::RecurrentThread>(
+             "FSM", 0, this->dt * 1e6, &CtrlFSM::run_, this);
+@@ -96,6 +139,22 @@ private:
+             }
+         }
+ 
++        if(nextStateMode == 0
++            && currentState->getStateString() == "FixStand"
++            && param::config["runtime"]
++            && param::config["runtime"]["auto_velocity_after"]
++            && FSMStringMap.right.count("Velocity"))
++        {
++            const auto delay_s = param::config["runtime"]["auto_velocity_after"].as<float>();
++            const auto elapsed = std::chrono::duration<float>(
++                std::chrono::steady_clock::now() - state_enter_time_
++            ).count();
++            if (elapsed >= delay_s)
++            {
++                nextStateMode = FSMStringMap.right.at("Velocity");
++            }
++        }
++
+         if(nextStateMode != 0 && !currentState->isState(nextStateMode))
+         {
+             for(auto & state : states)
+@@ -106,6 +165,7 @@ private:
+                     currentState->exit();
+                     currentState = state;
+                     currentState->enter();
++                    state_enter_time_ = std::chrono::steady_clock::now();
+                     break;
+                 }
+             }
+@@ -114,4 +174,5 @@ private:
+ 
+     std::shared_ptr<BaseState> currentState;
+     unitree::common::RecurrentThreadPtr fsm_thread_;
+-};
+\ No newline at end of file
++    std::chrono::steady_clock::time_point state_enter_time_{};
++};
+diff --git a/deploy/include/param.h b/deploy/include/param.h
+index dae4bb4..f6b2483 100644
+--- a/deploy/include/param.h
++++ b/deploy/include/param.h
+@@ -60,14 +60,17 @@ inline std::filesystem::path get_bin_path() {
+ inline void load_config_file()
+ {
+     assert(std::filesystem::exists(bin_path)); // run param::helper before this function
+-    if(bin_path.parent_path().filename() == "bin" || bin_path.parent_path().filename() == "build")
++    const auto bin_parent = bin_path.parent_path();
++    const auto parent_name = bin_parent.filename().string();
++    const bool in_build_dir = parent_name == "bin" || parent_name == "build" || parent_name.rfind("build", 0) == 0;
++    if(in_build_dir)
+     {
+-        proj_dir = bin_path.parent_path().parent_path();
++        proj_dir = bin_parent.parent_path();
+         config_dir = proj_dir / "config";
+     }
+     else
+     {
+-        proj_dir = bin_path.parent_path();
++        proj_dir = bin_parent;
+         config_dir = proj_dir;
+     }
+ 
+@@ -129,7 +132,13 @@ inline po::variables_map helper(int argc, char** argv)
+         ("help,h", "produce help message")
+         ("version,v", "show version")
+         ("log", "record log file")
++        ("domain_id,i", po::value<int>()->default_value(0), "dds domain id")
+         ("network,n", po::value<std::string>()->default_value(""), "dds network interface")
++        ("policy_dir", po::value<std::string>(), "override the Velocity FSM policy directory")
++        ("auto_start", po::value<std::string>(), "override the initial FSM state, e.g. FixStand")
++        ("auto_velocity_after", po::value<float>(), "automatically switch from FixStand to Velocity after N seconds")
++        ("orientation_limit", po::value<float>(), "override the bad_orientation limit angle in radians")
++        ("debug_rl", po::bool_switch(), "enable periodic RL state debug logs")
+         ;
+ 
+     po::variables_map vm;
+@@ -157,8 +166,33 @@ inline po::variables_map helper(int argc, char** argv)
+         std::filesystem::create_directories(proj_dir / "log");
+         spdlog::create_logger(proj_dir.string() + "/log/log.txt");
+     }
++    if(vm.count("policy_dir"))
++    {
++        config["FSM"]["Velocity"]["policy_dir"] = vm["policy_dir"].as<std::string>();
++        spdlog::info("Override policy directory: {}", config["FSM"]["Velocity"]["policy_dir"].as<std::string>());
++    }
++    if(vm.count("auto_start"))
++    {
++        config["runtime"]["auto_start"] = vm["auto_start"].as<std::string>();
++        spdlog::info("Override auto_start: {}", config["runtime"]["auto_start"].as<std::string>());
++    }
++    if(vm.count("auto_velocity_after"))
++    {
++        config["runtime"]["auto_velocity_after"] = vm["auto_velocity_after"].as<float>();
++        spdlog::info("Override auto_velocity_after: {}", config["runtime"]["auto_velocity_after"].as<float>());
++    }
++    if(vm.count("orientation_limit"))
++    {
++        config["runtime"]["orientation_limit"] = vm["orientation_limit"].as<float>();
++        spdlog::info("Override orientation_limit: {}", config["runtime"]["orientation_limit"].as<float>());
++    }
++    if(vm["debug_rl"].as<bool>())
++    {
++        config["runtime"]["debug_rl"] = true;
++        spdlog::info("Override debug_rl: true");
++    }
+ 
+     return vm;
+ }
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/deploy/robots/g1_29dof/CMakeLists.txt b/deploy/robots/g1_29dof/CMakeLists.txt
+index 0e29419..cc6a32a 100644
+--- a/deploy/robots/g1_29dof/CMakeLists.txt
++++ b/deploy/robots/g1_29dof/CMakeLists.txt
+@@ -3,29 +3,52 @@ project(g1_29dof_controller)
+ 
+ set(CMAKE_CXX_STANDARD 17)
+ 
++set(UNITREE_SDK2_PREFIX "$ENV{UNITREE_SDK2_PREFIX}" CACHE PATH "Path to a local unitree_sdk2 install prefix")
++if(UNITREE_SDK2_PREFIX)
++  list(PREPEND CMAKE_PREFIX_PATH "${UNITREE_SDK2_PREFIX}" "${UNITREE_SDK2_PREFIX}/lib/cmake")
++endif()
++if(DEFINED ENV{CONDA_PREFIX})
++  list(APPEND CMAKE_IGNORE_PREFIX_PATH "$ENV{CONDA_PREFIX}")
++endif()
++list(APPEND CMAKE_IGNORE_PREFIX_PATH "$ENV{HOME}/miniconda3")
++
++find_package(unitree_sdk2 REQUIRED CONFIG)
++find_package(Eigen3 REQUIRED)
+ find_package(Boost REQUIRED COMPONENTS program_options)
+-find_package(yaml-cpp REQUIRED)
+-
+-include_directories(
+-  /usr/include/eigen3
+-  /usr/local/include/ddscxx # dds
+-  /usr/local/include/iceoryx/v2.0.2 # dds
+-  include
+-  ${PROJECT_SOURCE_DIR}/../../thirdparty/onnxruntime-linux-x64-1.22.0/include
+-  ${PROJECT_SOURCE_DIR}/../../include/
+-)
++find_package(yaml-cpp REQUIRED CONFIG PATHS /usr/lib/x86_64-linux-gnu/cmake/yaml-cpp NO_DEFAULT_PATH)
++find_package(fmt REQUIRED CONFIG PATHS /usr/lib/x86_64-linux-gnu/cmake/fmt NO_DEFAULT_PATH)
+ 
+-link_libraries(
+-  unitree_sdk2 ddsc ddscxx rt pthread # dds
+-  libboost_program_options.a libyaml-cpp.a fmt
+-  ${PROJECT_SOURCE_DIR}/../../thirdparty/onnxruntime-linux-x64-1.22.0/lib/libonnxruntime.so.1.22.0
+-)
++set(ONNXRUNTIME_ROOT ${PROJECT_SOURCE_DIR}/../../thirdparty/onnxruntime-linux-x64-1.22.0)
++
++include_directories(include)
+ 
+ file(GLOB_RECURSE ADD_SRC_LIST
+   ${PROJECT_SOURCE_DIR}/src/*.cpp
+ )
+ 
+ add_library(${PROJECT_NAME}_lib ${ADD_SRC_LIST})
+-link_libraries(${PROJECT_NAME}_lib)
++target_include_directories(${PROJECT_NAME}_lib
++  PUBLIC
++    ${PROJECT_SOURCE_DIR}/../../include
++    ${ONNXRUNTIME_ROOT}/include
++)
++target_compile_definitions(${PROJECT_NAME}_lib
++  PUBLIC
++    SPDLOG_HEADER_ONLY
++)
++target_link_libraries(${PROJECT_NAME}_lib
++  PUBLIC
++    Eigen3::Eigen
++    unitree_sdk2
++    ddsc
++    ddscxx
++    Boost::program_options
++    yaml-cpp
++    fmt::fmt
++    rt
++    pthread
++    ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so.1.22.0
++)
+ 
+-add_executable(g1_ctrl main.cpp)
+\ No newline at end of file
++add_executable(g1_ctrl main.cpp)
++target_link_libraries(g1_ctrl PRIVATE ${PROJECT_NAME}_lib)
+diff --git a/deploy/robots/g1_29dof/main.cpp b/deploy/robots/g1_29dof/main.cpp
+index be40418..73f6e1a 100644
+--- a/deploy/robots/g1_29dof/main.cpp
++++ b/deploy/robots/g1_29dof/main.cpp
+@@ -34,7 +34,7 @@ int main(int argc, char** argv)
+     std::cout << "     G1-29dof Controller \n";
+ 
+     // Unitree DDS Config
+-    unitree::robot::ChannelFactory::Instance()->Init(0, vm["network"].as<std::string>());
++    unitree::robot::ChannelFactory::Instance()->Init(vm["domain_id"].as<int>(), vm["network"].as<std::string>());
+ 
+     init_fsm_state();
+ 
+@@ -58,4 +58,3 @@ int main(int argc, char** argv)
+     
+     return 0;
+ }
+-
+diff --git a/deploy/robots/g1_29dof/src/State_RLBase.cpp b/deploy/robots/g1_29dof/src/State_RLBase.cpp
+index 950df97..2a90100 100644
+--- a/deploy/robots/g1_29dof/src/State_RLBase.cpp
++++ b/deploy/robots/g1_29dof/src/State_RLBase.cpp
+@@ -2,7 +2,9 @@
+ #include "unitree_articulation.h"
+ #include "isaaclab/envs/mdp/observations/observations.h"
+ #include "isaaclab/envs/mdp/actions/joint_actions.h"
++#include <algorithm>
+ #include <unordered_map>
++#include <cmath>
+ 
+ namespace isaaclab
+ {
+@@ -37,6 +39,9 @@ State_RLBase::State_RLBase(int state_mode, std::string state_string)
+ {
+     auto cfg = param::config["FSM"][state_string];
+     auto policy_dir = param::parser_policy_dir(cfg["policy_dir"].as<std::string>());
++    const float orientation_limit = param::config["runtime"] && param::config["runtime"]["orientation_limit"]
++        ? param::config["runtime"]["orientation_limit"].as<float>()
++        : 1.0f;
+ 
+     env = std::make_unique<isaaclab::ManagerBasedRLEnv>(
+         YAML::LoadFile(policy_dir / "params" / "deploy.yaml"),
+@@ -46,7 +51,20 @@ State_RLBase::State_RLBase(int state_mode, std::string state_string)
+ 
+     this->registered_checks.emplace_back(
+         std::make_pair(
+-            [&]()->bool{ return isaaclab::mdp::bad_orientation(env.get(), 1.0); },
++            [&, orientation_limit]()->bool{
++                const auto & g = env->robot->data.projected_gravity_b;
++                const float cos_value = std::clamp(-g[2], -1.0f, 1.0f);
++                const float angle = std::fabs(std::acos(cos_value));
++                const bool bad = angle > orientation_limit;
++                if (bad)
++                {
++                    spdlog::warn(
++                        "RL termination: bad_orientation angle={:.3f} limit={:.3f} proj_g=[{:.3f}, {:.3f}, {:.3f}]",
++                        angle, orientation_limit, g[0], g[1], g[2]
++                    );
++                }
++                return bad;
++            },
+             FSMStringMap.right.at("Passive")
+         )
+     );
+@@ -54,8 +72,32 @@ State_RLBase::State_RLBase(int state_mode, std::string state_string)
+ 
+ void State_RLBase::run()
+ {
++    static int debug_counter = 0;
++    const bool debug_rl = param::config["runtime"] && param::config["runtime"]["debug_rl"]
++        ? param::config["runtime"]["debug_rl"].as<bool>()
++        : false;
++    if (debug_rl && (++debug_counter % 500 == 0))
++    {
++        const auto & g = env->robot->data.projected_gravity_b;
++        const float angle = std::fabs(std::acos(std::clamp(-g[2], -1.0f, 1.0f)));
++        const auto & joy = env->robot->data.joystick;
++        const auto action = env->action_manager->processed_actions();
++        float mean_abs_action = 0.0f;
++        float max_abs_action = 0.0f;
++        for (int i = 0; i < action.size(); ++i)
++        {
++            const float abs_v = std::fabs(action[i]);
++            mean_abs_action += abs_v;
++            max_abs_action = std::max(max_abs_action, abs_v);
++        }
++        mean_abs_action /= std::max<int>(1, action.size());
++        spdlog::info(
++            "RL debug: angle={:.3f} joy=[ly:{:.3f}, lx:{:.3f}, rx:{:.3f}] gravity=[{:.3f}, {:.3f}, {:.3f}] action_mean_abs={:.3f} action_max_abs={:.3f}",
++            angle, joy->ly(), joy->lx(), joy->rx(), g[0], g[1], g[2], mean_abs_action, max_abs_action
++        );
++    }
+     auto action = env->action_manager->processed_actions();
+     for(int i(0); i < env->robot->data.joint_ids_map.size(); i++) {
+         lowcmd->msg_.motor_cmd()[env->robot->data.joint_ids_map[i]].q() = action[i];
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/scripts/rsl_rl/play.py b/scripts/rsl_rl/play.py
+index fd5ff85..63fc163 100644
+--- a/scripts/rsl_rl/play.py
++++ b/scripts/rsl_rl/play.py
+@@ -24,11 +24,6 @@ parser.add_argument(
+ )
+ parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
+ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+-parser.add_argument(
+-    "--use_pretrained_checkpoint",
+-    action="store_true",
+-    help="Use the pre-trained checkpoint from Nucleus.",
+-)
+ parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+ # append RSL-RL cli arguments
+ cli_args.add_rsl_rl_args(parser)
+@@ -56,7 +51,7 @@ import isaaclab_tasks  # noqa: F401
+ from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
+ from isaaclab.utils.assets import retrieve_file_path
+ from isaaclab.utils.dict import print_dict
+-from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
++# from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
+ from isaaclab_tasks.utils import get_checkpoint_path
+ 
+@@ -80,12 +75,7 @@ def main():
+     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
+     log_root_path = os.path.abspath(log_root_path)
+     print(f"[INFO] Loading experiment from directory: {log_root_path}")
+-    if args_cli.use_pretrained_checkpoint:
+-        resume_path = get_published_pretrained_checkpoint("rsl_rl", args_cli.task)
+-        if not resume_path:
+-            print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
+-            return
+-    elif args_cli.checkpoint:
++    if args_cli.checkpoint:
+         resume_path = retrieve_file_path(args_cli.checkpoint)
+     else:
+         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+@@ -124,7 +114,17 @@ def main():
+         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+     else:
+         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+-    runner.load(resume_path)
++
++    # Load checkpoint - handle both standard and P3O formats
++    import torch
++    loaded_dict = torch.load(resume_path, map_location=agent_cfg.device, weights_only=False)
++    if "model_state_dict" in loaded_dict:
++        runner.load(resume_path)
++    elif "policy_state_dict" in loaded_dict:
++        print("[INFO]: Loading P3O model format (policy_state_dict)")
++        runner.alg.policy.load_state_dict(loaded_dict["policy_state_dict"])
++    else:
++        raise ValueError(f"Unknown checkpoint format. Keys: {list(loaded_dict.keys())}")
+ 
+     # obtain the trained policy for inference
+     policy = runner.get_inference_policy(device=env.unwrapped.device)
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/assets/robots/unitree.py b/source/unitree_rl_lab/unitree_rl_lab/assets/robots/unitree.py
+index e78413a..7661ce0 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/assets/robots/unitree.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/assets/robots/unitree.py
+@@ -17,7 +17,7 @@ from isaaclab.utils import configclass
+ 
+ from unitree_rl_lab.assets.robots import unitree_actuators
+ 
+-UNITREE_MODEL_DIR = "path/to/unitree_model"  # Replace with the actual path to your unitree_model directory
++UNITREE_MODEL_DIR = "/home/ubuntu/unitree_model"  # Path to downloaded unitree_model
+ UNITREE_ROS_DIR = "path/to/unitree_ros"  # Replace with the actual path to your unitree_ros package
+ 
+ 
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/agents/rsl_rl_ppo_cfg.py b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/agents/rsl_rl_ppo_cfg.py
+index f5f98fb..c2c82db 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/agents/rsl_rl_ppo_cfg.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/agents/rsl_rl_ppo_cfg.py
+@@ -11,7 +11,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
+ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
+     num_steps_per_env = 24
+     max_iterations = 50000
+-    save_interval = 100
++    save_interval = 1000
+     experiment_name = ""  # same as task name
+     empirical_normalization = False
+     policy = RslRlPpoActorCriticCfg(
+@@ -33,4 +33,5 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
+         lam=0.95,
+         desired_kl=0.01,
+         max_grad_norm=1.0,
++        optimizer="adam",  # rsl-rl < 2.4.0 will ignore this
+     )
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/commands/__init__.py b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/commands/__init__.py
+index fd5c9f2..b995200 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/commands/__init__.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/commands/__init__.py
+@@ -1 +1,2 @@
+-from .velocity_command import UniformLevelVelocityCommandCfg  # noqa: F401, F403
++from .velocity_command import *  # noqa: F401, F403
++from .target_command import *  # noqa: F401, F403
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/observations.py b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/observations.py
+index b1df0d4..3206b0f 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/observations.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/observations.py
+@@ -1,12 +1,797 @@
+ from __future__ import annotations
+ 
++import math
++from functools import lru_cache
++from pathlib import Path
++
++import numpy as np
+ import torch
+ from typing import TYPE_CHECKING
+ 
++try:
++    import torch_fpsample
++except ImportError:
++    torch_fpsample = None
++
+ if TYPE_CHECKING:
+     from isaaclab.envs import ManagerBasedRLEnv
+ 
+ 
++def _get_root_yaw(root_quat_w: torch.Tensor) -> torch.Tensor:
++    """Extract yaw from Isaac Lab root quaternions in wxyz format."""
++    qw = root_quat_w[:, 0]
++    qx = root_quat_w[:, 1]
++    qy = root_quat_w[:, 2]
++    qz = root_quat_w[:, 3]
++    return torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
++
++
++def _build_raycast_dirs(root_yaw: torch.Tensor, num_rays: int, fov_deg: float) -> torch.Tensor:
++    """Build a fan of 2D ray directions in the world frame."""
++    half_fov = math.radians(fov_deg) * 0.5
++    ray_offsets = torch.linspace(
++        -half_fov,
++        half_fov,
++        steps=num_rays,
++        device=root_yaw.device,
++        dtype=root_yaw.dtype,
++    )
++    ray_angles = root_yaw.unsqueeze(1) + ray_offsets.unsqueeze(0)
++    return torch.stack((torch.cos(ray_angles), torch.sin(ray_angles)), dim=-1)
++
++
++@lru_cache(maxsize=16)
++def _load_omni_pattern(pattern_file: str, samples: int) -> tuple[np.ndarray, np.ndarray]:
++    pattern = np.load(pattern_file)
++    if pattern.ndim != 2 or pattern.shape[1] != 2:
++        raise ValueError(f"Expected LiDAR pattern with shape (N, 2), got {pattern.shape}")
++    if samples <= 0:
++        raise ValueError(f"samples must be positive, got {samples}")
++    if samples >= pattern.shape[0]:
++        selected = pattern
++    else:
++        idx = np.linspace(0, pattern.shape[0] - 1, num=samples, dtype=np.int64)
++        selected = pattern[idx]
++    return selected[:, 0].astype(np.float32), selected[:, 1].astype(np.float32)
++
++
++def _quat_apply(quat_wxyz: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
++    """Rotate vectors by quaternions in wxyz format."""
++    q_w = quat_wxyz[:, 0:1]
++    q_xyz = quat_wxyz[:, 1:4]
++    uv = torch.cross(q_xyz.unsqueeze(1).expand_as(vec), vec, dim=-1)
++    uuv = torch.cross(q_xyz.unsqueeze(1).expand_as(vec), uv, dim=-1)
++    return vec + 2.0 * (q_w.unsqueeze(1) * uv + uuv)
++
++
++def _quat_conjugate(quat_wxyz: torch.Tensor) -> torch.Tensor:
++    quat_conj = quat_wxyz.clone()
++    quat_conj[:, 1:] = -quat_conj[:, 1:]
++    return quat_conj
++
++
++def _raycast_against_cylinders(
++    ray_origins_xy: torch.Tensor,
++    ray_dirs_xy: torch.Tensor,
++    obstacle_positions: torch.Tensor,
++    max_distance: float,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Analytical 2D ray-cast against cylindrical pillar obstacles."""
++    num_envs, num_rays, _ = ray_dirs_xy.shape
++    if obstacle_positions.shape[1] == 0:
++        distances = torch.full((num_envs, num_rays), max_distance, device=ray_dirs_xy.device, dtype=ray_dirs_xy.dtype)
++        hit_dirs = ray_dirs_xy.clone()
++        return distances, hit_dirs
++
++    obstacle_xy = obstacle_positions[:, :, :2]
++    obstacle_radius = obstacle_positions[:, :, 2]
++
++    origin_to_center = ray_origins_xy[:, None, None, :] - obstacle_xy[:, None, :, :]
++    ray_dirs_expanded = ray_dirs_xy[:, :, None, :]
++
++    b_term = torch.sum(ray_dirs_expanded * origin_to_center, dim=-1)
++    c_term = torch.sum(origin_to_center * origin_to_center, dim=-1) - obstacle_radius[:, None, :] ** 2
++    discriminant = b_term**2 - c_term
++
++    valid_intersection = discriminant >= 0.0
++    sqrt_discriminant = torch.sqrt(torch.clamp(discriminant, min=0.0))
++    t1 = -b_term - sqrt_discriminant
++    t2 = -b_term + sqrt_discriminant
++
++    inf = torch.full_like(t1, float("inf"))
++    t1 = torch.where((t1 > 0.0) & valid_intersection, t1, inf)
++    t2 = torch.where((t2 > 0.0) & valid_intersection, t2, inf)
++    hit_distance = torch.minimum(t1, t2)
++    hit_distance = torch.where(hit_distance.isfinite(), hit_distance, torch.full_like(hit_distance, max_distance))
++
++    min_hit_distance, hit_indices = torch.min(hit_distance, dim=-1)
++    min_hit_distance = torch.clamp(min_hit_distance, max=max_distance)
++
++    env_ids = torch.arange(num_envs, device=ray_dirs_xy.device).unsqueeze(1).expand(num_envs, num_rays)
++    hit_dirs = ray_dirs_xy[env_ids, torch.arange(num_rays, device=ray_dirs_xy.device).unsqueeze(0).expand(num_envs, num_rays)]
++    _ = hit_indices
++    return min_hit_distance, hit_dirs
++
++
++def _raycast_pointcloud_against_cylinders(
++    ray_origins_w: torch.Tensor,
++    ray_dirs_w: torch.Tensor,
++    obstacle_positions: torch.Tensor,
++    obstacle_height: float,
++    max_distance: float,
++) -> torch.Tensor:
++    """Analytical 3D ray-cast against finite vertical cylinders.
++
++    Returns hit points in sensor frame as distances along each ray; no-hit rays
++    are assigned max_distance.
++    """
++    num_envs, num_rays, _ = ray_dirs_w.shape
++    if obstacle_positions.shape[1] == 0:
++        return torch.full((num_envs, num_rays), max_distance, device=ray_dirs_w.device, dtype=ray_dirs_w.dtype)
++
++    ox = ray_origins_w[:, None, None, 0]
++    oy = ray_origins_w[:, None, None, 1]
++    oz = ray_origins_w[:, None, None, 2]
++    dx = ray_dirs_w[:, :, None, 0]
++    dy = ray_dirs_w[:, :, None, 1]
++    dz = ray_dirs_w[:, :, None, 2]
++
++    cx = obstacle_positions[:, None, :, 0]
++    cy = obstacle_positions[:, None, :, 1]
++    radius = obstacle_positions[:, None, :, 2]
++    z_min = torch.zeros_like(radius)
++    z_max = torch.full_like(radius, obstacle_height)
++
++    a = dx * dx + dy * dy
++    b = 2.0 * ((ox - cx) * dx + (oy - cy) * dy)
++    c = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy) - radius * radius
++
++    discriminant = b * b - 4.0 * a * c
++    valid = (discriminant >= 0.0) & (a > 1.0e-8)
++    sqrt_disc = torch.sqrt(torch.clamp(discriminant, min=0.0))
++
++    inf = torch.full_like(a, float("inf"))
++    t1 = torch.where(valid, (-b - sqrt_disc) / (2.0 * a), inf)
++    t2 = torch.where(valid, (-b + sqrt_disc) / (2.0 * a), inf)
++    z1 = oz + t1 * dz
++    z2 = oz + t2 * dz
++
++    t1 = torch.where((t1 > 0.0) & (z1 >= z_min) & (z1 <= z_max), t1, inf)
++    t2 = torch.where((t2 > 0.0) & (z2 >= z_min) & (z2 <= z_max), t2, inf)
++
++    side_hit = torch.minimum(t1, t2)
++    side_hit = torch.where(side_hit.isfinite(), side_hit, inf)
++    min_hit_distance, _ = torch.min(side_hit, dim=-1)
++    min_hit_distance = torch.where(min_hit_distance.isfinite(), min_hit_distance, torch.full_like(min_hit_distance, max_distance))
++    return torch.clamp(min_hit_distance, max=max_distance)
++
++
++def obstacle_raycast_scan(
++    env: ManagerBasedRLEnv,
++    num_rays: int = 9,
++    max_distance: float = 6.0,
++    fov_deg: float = 180.0,
++) -> torch.Tensor:
++    """Return a fan of obstacle distances derived from analytical ray-casting against spawned pillars."""
++    if not hasattr(env, "obstacle_manager"):
++        return torch.full((env.num_envs, num_rays), max_distance, device=env.device)
++
++    robot = env.scene["robot"]
++    ray_origins_xy = robot.data.root_pos_w[:, :2]
++    root_yaw = _get_root_yaw(robot.data.root_quat_w)
++    ray_dirs_xy = _build_raycast_dirs(root_yaw, num_rays, fov_deg)
++    obstacle_positions = env.obstacle_manager.get_geometry_proxy_tensor(ray_origins_xy.device)
++
++    distances, _ = _raycast_against_cylinders(ray_origins_xy, ray_dirs_xy, obstacle_positions, max_distance)
++    return distances
++
++
++def omni_lidar_pointcloud(
++    env: ManagerBasedRLEnv,
++    pattern_file: str = "/home/ubuntu/P3O-CBF/OmniPerception/LidarSensor/LidarSensor/sensor_pattern/sensor_lidar/scan_mode/mid360.npy",
++    samples: int = 512,
++    max_distance: float = 6.0,
++    sensor_offset: tuple[float, float, float] = (0.10, 0.0, 0.63),
++) -> torch.Tensor:
++    """Generate a flattened local point cloud using OmniPerception's Livox pattern.
++
++    This keeps the existing obstacle environment and analytically ray-casts
++    against the spawned cylinders, but replaces the low-dimensional fan scan
++    with a Mid-360 style point-cloud observation.
++    """
++    robot = env.scene["robot"]
++    device = robot.data.root_pos_w.device
++    dtype = robot.data.root_pos_w.dtype
++
++    theta_np, phi_np = _load_omni_pattern(pattern_file, samples)
++    theta = torch.as_tensor(theta_np, device=device, dtype=dtype)
++    phi = torch.as_tensor(phi_np, device=device, dtype=dtype)
++
++    local_dirs = torch.stack(
++        (
++            torch.cos(theta) * torch.cos(phi),
++            torch.sin(theta) * torch.cos(phi),
++            torch.sin(phi),
++        ),
++        dim=-1,
++    ).unsqueeze(0).expand(env.num_envs, -1, -1)
++
++    root_quat = robot.data.root_quat_w
++    sensor_offset_local = torch.tensor(sensor_offset, device=device, dtype=dtype).unsqueeze(0).expand(env.num_envs, -1)
++    sensor_origin_w = robot.data.root_pos_w + _quat_apply(root_quat, sensor_offset_local.unsqueeze(1)).squeeze(1)
++    ray_dirs_w = _quat_apply(root_quat, local_dirs)
++
++    if not hasattr(env, "obstacle_manager"):
++        return (local_dirs * max_distance).reshape(env.num_envs, -1)
++
++    obstacle_positions = env.obstacle_manager.get_geometry_proxy_tensor(device)
++    obstacle_height = float(getattr(env.unwrapped.cfg, "obstacle_height", 2.0))
++    hit_distances = _raycast_pointcloud_against_cylinders(
++        sensor_origin_w,
++        ray_dirs_w,
++        obstacle_positions,
++        obstacle_height=obstacle_height,
++        max_distance=max_distance,
++    )
++    pointcloud_local = local_dirs * hit_distances.unsqueeze(-1)
++    return pointcloud_local.reshape(env.num_envs, -1)
++
++
++def _batched_fps_fallback(points: torch.Tensor, valid_mask: torch.Tensor, num_samples: int) -> torch.Tensor:
++    """Vectorized batched FPS fallback when torch_fpsample is unavailable."""
++    batch_size, max_points, _ = points.shape
++    device = points.device
++    dtype = points.dtype
++    points = points.contiguous()
++    valid_mask = valid_mask.contiguous()
++
++    if max_points == 0 or num_samples <= 0:
++        return torch.zeros(batch_size, max(num_samples, 0), 3, device=device, dtype=dtype)
++
++    valid_counts = valid_mask.sum(dim=1)
++    any_valid = valid_counts > 0
++    if not torch.any(any_valid):
++        return torch.zeros(batch_size, num_samples, 3, device=device, dtype=dtype)
++
++    range_sq = torch.sum(points * points, dim=-1)
++    invalid_large = torch.full_like(range_sq, float("inf"))
++    first_idx = torch.argmin(torch.where(valid_mask, range_sq, invalid_large), dim=1)
++    first_idx = torch.where(any_valid, first_idx, torch.zeros_like(first_idx))
++
++    batch_ids = torch.arange(batch_size, device=device)
++    min_dist = torch.full((batch_size, max_points), float("inf"), device=device, dtype=dtype)
++    selected_indices = torch.zeros((batch_size, num_samples), device=device, dtype=torch.long)
++    current_idx = first_idx
++
++    for i in range(num_samples):
++        selected_indices[:, i] = current_idx
++        current_points = points[batch_ids, current_idx].unsqueeze(1)
++        sq_dist = torch.sum((points - current_points) ** 2, dim=-1)
++        min_dist = torch.minimum(min_dist, sq_dist)
++        masked_dist = torch.where(valid_mask, min_dist, torch.full_like(min_dist, -1.0))
++        current_idx = torch.argmax(masked_dist, dim=1)
++
++    sampled = points[batch_ids.unsqueeze(1), selected_indices]
++    keep_mask = torch.arange(num_samples, device=device).unsqueeze(0) < valid_counts.unsqueeze(1)
++    return sampled * keep_mask.unsqueeze(-1)
++
++
++def _fps_sample_pointcloud(points: torch.Tensor, valid_mask: torch.Tensor, num_samples: int) -> torch.Tensor:
++    """Sample a fixed-size point set with FPS, zero-padding invalid outputs."""
++    batch_size, max_points, _ = points.shape
++    device = points.device
++    dtype = points.dtype
++
++    if max_points == 0 or num_samples <= 0:
++        return torch.zeros(batch_size, max(num_samples, 0), 3, device=device, dtype=dtype)
++
++    valid_counts = valid_mask.sum(dim=1)
++    any_valid = valid_counts > 0
++    if not torch.any(any_valid):
++        return torch.zeros(batch_size, num_samples, 3, device=device, dtype=dtype)
++
++    # Fill padding points with the first valid point to avoid degenerate FPS distance fields.
++    first_valid_idx = torch.argmax(valid_mask.long(), dim=1)
++    batch_ids = torch.arange(batch_size, device=device)
++    first_valid_points = points[batch_ids, first_valid_idx].unsqueeze(1).expand(-1, max_points, -1)
++    padded_points = torch.where(valid_mask.unsqueeze(-1), points, first_valid_points)
++
++    if torch_fpsample is not None:
++        k_eff = min(num_samples, max_points)
++        sample_points_input = padded_points
++        sample_valid_counts = valid_counts
++        used_cpu_fps = False
++        if padded_points.is_cuda:
++            try:
++                sample_points_input = sample_points_input.contiguous()
++                sampled_points, sampled_indices = torch_fpsample.sample(sample_points_input, k_eff)
++            except (NotImplementedError, RuntimeError) as e:
++                print(f"[WARN] torch_fpsample.sample failed on CUDA ({type(e).__name__}: {e}), using pure-PyTorch fallback")
++                return _batched_fps_fallback(padded_points, valid_mask, num_samples)
++        else:
++            sampled_points, sampled_indices = torch_fpsample.sample(sample_points_input, k_eff)
++
++        if used_cpu_fps:
++            sampled_points = sampled_points.to(device=device, dtype=dtype)
++            sampled_indices = sampled_indices.to(device=device)
++
++        invalid_samples = sampled_indices >= sample_valid_counts.to(device=device).unsqueeze(1)
++        sampled_points = sampled_points.masked_fill(invalid_samples.unsqueeze(-1), 0.0)
++        if k_eff < num_samples:
++            output = torch.zeros(batch_size, num_samples, 3, device=device, dtype=dtype)
++            output[:, :k_eff, :] = sampled_points
++            return output
++        return sampled_points
++
++    return _batched_fps_fallback(padded_points, valid_mask, num_samples)
++
++
++def omni_lidar_range_features(
++    env: ManagerBasedRLEnv,
++    pattern_file: str = "/home/ubuntu/P3O-CBF/OmniPerception/LidarSensor/LidarSensor/sensor_pattern/sensor_lidar/scan_mode/mid360.npy",
++    samples: int = 512,
++    feature_dim: int = 64,
++    max_distance: float = 6.0,
++    sensor_offset: tuple[float, float, float] = (0.10, 0.0, 0.63),
++) -> torch.Tensor:
++    """Compress an Omni/Mid360 point cloud into a compact 64-D LiDAR feature.
++
++    The paper-style policy uses a compact LiDAR embedding before the policy
++    trunk. This observation keeps the Mid360 sampling geometry but pools dense
++    ray distances into a fixed low-dimensional feature so rollout storage does
++    not carry the full flattened point cloud.
++    """
++    if feature_dim <= 0:
++        raise ValueError(f"feature_dim must be positive, got {feature_dim}")
++
++    pointcloud = omni_lidar_pointcloud(
++        env,
++        pattern_file=pattern_file,
++        samples=samples,
++        max_distance=max_distance,
++        sensor_offset=sensor_offset,
++    ).view(env.num_envs, -1, 3)
++    ranges = torch.linalg.norm(pointcloud, dim=-1).clamp(max=max_distance)
++    num_samples = ranges.shape[1]
++
++    if num_samples == feature_dim:
++        return ranges
++    if num_samples < feature_dim:
++        pad = torch.full(
++            (env.num_envs, feature_dim - num_samples),
++            max_distance,
++            device=ranges.device,
++            dtype=ranges.dtype,
++        )
++        return torch.cat((ranges, pad), dim=-1)
++
++    # Deterministic angular-order pooling: each feature stores the closest
++    # return inside a contiguous block of Mid360 rays.
++    boundaries = torch.linspace(0, num_samples, feature_dim + 1, device=ranges.device)
++    features = []
++    for i in range(feature_dim):
++        start = int(torch.floor(boundaries[i]).item())
++        end = int(torch.ceil(boundaries[i + 1]).item())
++        end = max(start + 1, min(end, num_samples))
++        features.append(ranges[:, start:end].amin(dim=1))
++    return torch.stack(features, dim=-1)
++
++
++def omni_lidar_realg1_pointcloud_fps(
++    env: ManagerBasedRLEnv,
++    pattern_file: str = "/home/ubuntu/P3O-CBF/OmniPerception/LidarSensor/LidarSensor/sensor_pattern/sensor_lidar/scan_mode/mid360.npy",
++    samples: int = 1024,
++    num_fps_points: int = 128,
++    max_distance: float = 6.0,
++    sensor_offset: tuple[float, float, float] = (0.10, 0.0, 0.63),
++    horizontal_fov_deg: float = 180.0,
++    roi_x_min: float = -0.5,
++    roi_x_max: float = 6.0,
++    roi_abs_y_max: float = 3.0,
++    roi_z_min: float = -1.0,
++    roi_z_max: float = 0.8,
++    min_planar_distance: float = 0.2,
++    enable_sensor_noise: bool = True,
++    random_distance_noise: float = 0.02,
++    pixel_dropout_prob: float = 0.01,
++    sector_dropout_prob: float = 0.10,
++    sector_dropout_width_deg: float = 8.0,
++    random_translation_range: tuple[float, float, float] = (0.015, 0.015, 0.015),
++    random_rotation_deg_range: tuple[float, float, float] = (2.0, 2.0, 2.0),
++) -> torch.Tensor:
++    """Paper-style Mid360 point cloud with ROI filtering, corruption and FPS downsampling."""
++    pointcloud_sensor = omni_lidar_pointcloud(
++        env,
++        pattern_file=pattern_file,
++        samples=samples,
++        max_distance=max_distance,
++        sensor_offset=sensor_offset,
++    ).view(env.num_envs, -1, 3)
++
++    points_base = _apply_realg1_mid360_corruption(
++        pointcloud_sensor=pointcloud_sensor,
++        max_distance=max_distance,
++        sensor_offset=sensor_offset,
++        enable_sensor_noise=enable_sensor_noise,
++        random_distance_noise=random_distance_noise,
++        pixel_dropout_prob=pixel_dropout_prob,
++        sector_dropout_prob=sector_dropout_prob,
++        sector_dropout_width_deg=sector_dropout_width_deg,
++        random_translation_range=random_translation_range,
++        random_rotation_deg_range=random_rotation_deg_range,
++    )
++
++    x = points_base[..., 0]
++    y = points_base[..., 1]
++    z = points_base[..., 2]
++    planar_range = torch.sqrt(torch.clamp(x * x + y * y, min=1.0e-9))
++    theta = torch.atan2(y, x)
++    half_fov = math.radians(horizontal_fov_deg) * 0.5
++    valid = (
++        (x >= roi_x_min)
++        & (x <= roi_x_max)
++        & (torch.abs(y) <= roi_abs_y_max)
++        & (z >= roi_z_min)
++        & (z <= roi_z_max)
++        & (planar_range >= min_planar_distance)
++        & (planar_range <= max_distance)
++        & (torch.abs(theta) <= half_fov)
++    )
++
++    sampled = _fps_sample_pointcloud(points_base, valid, num_fps_points)
++    return sampled.reshape(env.num_envs, -1)
++
++
++def _euler_xyz_to_matrix(angles: torch.Tensor) -> torch.Tensor:
++    """Convert XYZ Euler angles to rotation matrices."""
++    roll = angles[:, 0]
++    pitch = angles[:, 1]
++    yaw = angles[:, 2]
++
++    cr, sr = torch.cos(roll), torch.sin(roll)
++    cp, sp = torch.cos(pitch), torch.sin(pitch)
++    cy, sy = torch.cos(yaw), torch.sin(yaw)
++
++    row0 = torch.stack((cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr), dim=-1)
++    row1 = torch.stack((sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr), dim=-1)
++    row2 = torch.stack((-sp, cp * sr, cp * cr), dim=-1)
++    return torch.stack((row0, row1, row2), dim=1)
++
++
++def _apply_realg1_mid360_corruption(
++    pointcloud_sensor: torch.Tensor,
++    max_distance: float,
++    sensor_offset: tuple[float, float, float],
++    enable_sensor_noise: bool,
++    random_distance_noise: float,
++    pixel_dropout_prob: float,
++    sector_dropout_prob: float,
++    sector_dropout_width_deg: float,
++    random_translation_range: tuple[float, float, float],
++    random_rotation_deg_range: tuple[float, float, float],
++) -> torch.Tensor:
++    """Approximate deployment-side Mid360 corruption before range64 compression."""
++    num_envs, _, _ = pointcloud_sensor.shape
++    device = pointcloud_sensor.device
++    dtype = pointcloud_sensor.dtype
++
++    points = pointcloud_sensor
++
++    offset = torch.tensor(sensor_offset, device=device, dtype=dtype).view(1, 1, 3).expand(num_envs, -1, -1)
++    if enable_sensor_noise:
++        trans_range = torch.tensor(random_translation_range, device=device, dtype=dtype).view(1, 1, 3)
++        trans_noise = (2.0 * torch.rand(num_envs, 1, 3, device=device, dtype=dtype) - 1.0) * trans_range
++        offset = offset + trans_noise
++
++        rot_range = torch.tensor(random_rotation_deg_range, device=device, dtype=dtype) * (math.pi / 180.0)
++        euler_noise = (2.0 * torch.rand(num_envs, 3, device=device, dtype=dtype) - 1.0) * rot_range
++        rot_mat = _euler_xyz_to_matrix(euler_noise)
++        points = torch.matmul(points, rot_mat.transpose(1, 2))
++
++    points_base = points + offset
++
++    if enable_sensor_noise and random_distance_noise > 0.0:
++        ray_norm = torch.linalg.norm(points, dim=-1, keepdim=True).clamp_min(1.0e-6)
++        ray_dir = points / ray_norm
++        distance_noise = torch.randn_like(ray_norm) * random_distance_noise
++        points_base = points_base + ray_dir * distance_noise
++
++    if enable_sensor_noise and pixel_dropout_prob > 0.0:
++        dropout_mask = torch.rand(num_envs, points_base.shape[1], 1, device=device, dtype=dtype) < pixel_dropout_prob
++        far_points = points_base / torch.linalg.norm(points_base, dim=-1, keepdim=True).clamp_min(1.0e-6) * max_distance
++        points_base = torch.where(dropout_mask, far_points, points_base)
++
++    if enable_sensor_noise and sector_dropout_prob > 0.0 and sector_dropout_width_deg > 0.0:
++        planar_theta = torch.atan2(points_base[..., 1], points_base[..., 0])
++        half_width = math.radians(sector_dropout_width_deg) * 0.5
++        sector_centers = (2.0 * torch.rand(num_envs, 1, device=device, dtype=dtype) - 1.0) * math.pi
++        sector_active = torch.rand(num_envs, 1, device=device, dtype=dtype) < sector_dropout_prob
++        theta_diff = torch.atan2(torch.sin(planar_theta - sector_centers), torch.cos(planar_theta - sector_centers))
++        sector_mask = sector_active.unsqueeze(-1) & (torch.abs(theta_diff).unsqueeze(-1) <= half_width)
++        far_points = points_base / torch.linalg.norm(points_base, dim=-1, keepdim=True).clamp_min(1.0e-6) * max_distance
++        points_base = torch.where(sector_mask, far_points, points_base)
++
++    return points_base
++
++
++def omni_lidar_realg1_range_features(
++    env: ManagerBasedRLEnv,
++    pattern_file: str = "/home/ubuntu/P3O-CBF/OmniPerception/LidarSensor/LidarSensor/sensor_pattern/sensor_lidar/scan_mode/mid360.npy",
++    samples: int = 1024,
++    feature_dim: int = 64,
++    max_distance: float = 6.0,
++    sensor_offset: tuple[float, float, float] = (0.10, 0.0, 0.63),
++    horizontal_fov_deg: float = 180.0,
++    roi_x_min: float = -0.5,
++    roi_x_max: float = 6.0,
++    roi_abs_y_max: float = 3.0,
++    roi_z_min: float = -1.0,
++    roi_z_max: float = 0.8,
++    min_planar_distance: float = 0.2,
++    enable_sensor_noise: bool = True,
++    random_distance_noise: float = 0.02,
++    pixel_dropout_prob: float = 0.01,
++    sector_dropout_prob: float = 0.10,
++    sector_dropout_width_deg: float = 8.0,
++    random_translation_range: tuple[float, float, float] = (0.015, 0.015, 0.015),
++    random_rotation_deg_range: tuple[float, float, float] = (2.0, 2.0, 2.0),
++) -> torch.Tensor:
++    """Compress Mid360-style pointclouds into deployment-oriented 64-D realG1 features.
++
++    The output is defined in the robot base frame so the same compression can be
++    reproduced later inside rl_sar on the real G1.
++    """
++    if feature_dim <= 0:
++        raise ValueError(f"feature_dim must be positive, got {feature_dim}")
++
++    pointcloud_sensor = omni_lidar_pointcloud(
++        env,
++        pattern_file=pattern_file,
++        samples=samples,
++        max_distance=max_distance,
++        sensor_offset=sensor_offset,
++    ).view(env.num_envs, -1, 3)
++
++    points_base = _apply_realg1_mid360_corruption(
++        pointcloud_sensor=pointcloud_sensor,
++        max_distance=max_distance,
++        sensor_offset=sensor_offset,
++        enable_sensor_noise=enable_sensor_noise,
++        random_distance_noise=random_distance_noise,
++        pixel_dropout_prob=pixel_dropout_prob,
++        sector_dropout_prob=sector_dropout_prob,
++        sector_dropout_width_deg=sector_dropout_width_deg,
++        random_translation_range=random_translation_range,
++        random_rotation_deg_range=random_rotation_deg_range,
++    )
++
++    x = points_base[..., 0]
++    y = points_base[..., 1]
++    z = points_base[..., 2]
++    planar_range = torch.sqrt(torch.clamp(x * x + y * y, min=1.0e-9))
++    theta = torch.atan2(y, x)
++
++    half_fov = math.radians(horizontal_fov_deg) * 0.5
++    valid = (
++        (x >= roi_x_min)
++        & (x <= roi_x_max)
++        & (torch.abs(y) <= roi_abs_y_max)
++        & (z >= roi_z_min)
++        & (z <= roi_z_max)
++        & (planar_range >= min_planar_distance)
++        & (planar_range <= max_distance)
++        & (torch.abs(theta) <= half_fov)
++    )
++
++    bin_boundaries = torch.linspace(-half_fov, half_fov, feature_dim + 1, device=points_base.device, dtype=points_base.dtype)
++    features = torch.full((env.num_envs, feature_dim), max_distance, device=points_base.device, dtype=points_base.dtype)
++    inf = torch.full_like(planar_range, float("inf"))
++
++    for i in range(feature_dim):
++        lower = bin_boundaries[i]
++        upper = bin_boundaries[i + 1]
++        in_bin = valid & (theta >= lower) & (theta < upper if i < feature_dim - 1 else theta <= upper)
++        bin_ranges = torch.where(in_bin, planar_range, inf)
++        features[:, i] = torch.where(
++            torch.any(in_bin, dim=1),
++            torch.amin(bin_ranges, dim=1),
++            torch.full((env.num_envs,), max_distance, device=points_base.device, dtype=points_base.dtype),
++        )
++
++    features = torch.clamp(features, min=min_planar_distance, max=max_distance)
++    all_invalid = ~torch.any(valid, dim=1)
++    features[all_invalid] = max_distance
++    return features
++
++
++def mid360_realg1_range_features_from_raycaster(
++    env: ManagerBasedRLEnv,
++    sensor_name: str = "mid360_lidar",
++    feature_dim: int = 64,
++    max_distance: float = 6.0,
++    sensor_offset: tuple[float, float, float] = (0.10, 0.0, 0.63),
++    horizontal_fov_deg: float = 180.0,
++    roi_x_min: float = -0.5,
++    roi_x_max: float = 6.0,
++    roi_abs_y_max: float = 3.0,
++    roi_z_min: float = -1.0,
++    roi_z_max: float = 0.8,
++    min_planar_distance: float = 0.2,
++    enable_sensor_noise: bool = True,
++    random_distance_noise: float = 0.02,
++    pixel_dropout_prob: float = 0.01,
++    sector_dropout_prob: float = 0.10,
++    sector_dropout_width_deg: float = 8.0,
++    random_translation_range: tuple[float, float, float] = (0.015, 0.015, 0.015),
++    random_rotation_deg_range: tuple[float, float, float] = (2.0, 2.0, 2.0),
++) -> torch.Tensor:
++    """Compress Mid360 ray hits from an IsaacLab RayCaster into realG1 deployment features."""
++    if feature_dim <= 0:
++        raise ValueError(f"feature_dim must be positive, got {feature_dim}")
++
++    sensor = env.scene[sensor_name]
++    sensor_pos_w = sensor.data.pos_w
++    sensor_quat_w = sensor.data.quat_w
++    hit_points_w = sensor.data.ray_hits_w
++
++    sensor_pos_expanded = sensor_pos_w.unsqueeze(1).expand_as(hit_points_w)
++    hit_vectors_w = hit_points_w - sensor_pos_expanded
++    hit_vectors_w = torch.where(torch.isfinite(hit_vectors_w), hit_vectors_w, torch.zeros_like(hit_vectors_w))
++    quat_inv = _quat_conjugate(sensor_quat_w)
++    pointcloud_sensor = _quat_apply(
++        quat_inv,
++        hit_vectors_w,
++    )
++
++    no_hit_mask = torch.any(torch.isinf(hit_points_w), dim=-1, keepdim=True)
++    if torch.any(no_hit_mask):
++        ray_norm = torch.linalg.norm(pointcloud_sensor, dim=-1, keepdim=True).clamp_min(1.0e-6)
++        far_points_sensor = pointcloud_sensor / ray_norm * max_distance
++        pointcloud_sensor = torch.where(no_hit_mask, far_points_sensor, pointcloud_sensor)
++
++    points_base = _apply_realg1_mid360_corruption(
++        pointcloud_sensor=pointcloud_sensor,
++        max_distance=max_distance,
++        sensor_offset=sensor_offset,
++        enable_sensor_noise=enable_sensor_noise,
++        random_distance_noise=random_distance_noise,
++        pixel_dropout_prob=pixel_dropout_prob,
++        sector_dropout_prob=sector_dropout_prob,
++        sector_dropout_width_deg=sector_dropout_width_deg,
++        random_translation_range=random_translation_range,
++        random_rotation_deg_range=random_rotation_deg_range,
++    )
++
++    x = points_base[..., 0]
++    y = points_base[..., 1]
++    z = points_base[..., 2]
++    planar_range = torch.sqrt(torch.clamp(x * x + y * y, min=1.0e-9))
++    theta = torch.atan2(y, x)
++
++    half_fov = math.radians(horizontal_fov_deg) * 0.5
++    valid = (
++        (x >= roi_x_min)
++        & (x <= roi_x_max)
++        & (torch.abs(y) <= roi_abs_y_max)
++        & (z >= roi_z_min)
++        & (z <= roi_z_max)
++        & (planar_range >= min_planar_distance)
++        & (planar_range <= max_distance)
++        & (torch.abs(theta) <= half_fov)
++    )
++
++    bin_boundaries = torch.linspace(-half_fov, half_fov, feature_dim + 1, device=points_base.device, dtype=points_base.dtype)
++    features = torch.full((env.num_envs, feature_dim), max_distance, device=points_base.device, dtype=points_base.dtype)
++    inf = torch.full_like(planar_range, float("inf"))
++
++    for i in range(feature_dim):
++        lower = bin_boundaries[i]
++        upper = bin_boundaries[i + 1]
++        in_bin = valid & (theta >= lower) & (theta < upper if i < feature_dim - 1 else theta <= upper)
++        bin_ranges = torch.where(in_bin, planar_range, inf)
++        features[:, i] = torch.where(
++            torch.any(in_bin, dim=1),
++            torch.amin(bin_ranges, dim=1),
++            torch.full((env.num_envs,), max_distance, device=points_base.device, dtype=points_base.dtype),
++        )
++
++    features = torch.clamp(features, min=min_planar_distance, max=max_distance)
++    all_invalid = ~torch.any(valid, dim=1)
++    features[all_invalid] = max_distance
++    return features
++
++
++def closest_mid360_obstacle(
++    env: ManagerBasedRLEnv,
++    sensor_name: str = "mid360_lidar",
++    max_distance: float = 6.0,
++    horizontal_fov_deg: float = 180.0,
++    roi_x_min: float = -0.5,
++    roi_x_max: float = 6.0,
++    roi_abs_y_max: float = 3.0,
++    roi_z_min: float = -1.0,
++    roi_z_max: float = 0.8,
++    min_planar_distance: float = 0.2,
++    robot_body_radius: float = 0.4,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Closest obstacle surface estimate from real Mid360 ray hits.
++
++    The returned distance is derived only from the ray-caster point cloud. It
++    intentionally does not use obstacle-manager geometry, so P3O/CBF costs stay
++    tied to the same sensing signal used by deployment.
++    """
++    robot = env.scene["robot"]
++    try:
++        sensor = env.scene[sensor_name]
++    except KeyError as exc:
++        raise RuntimeError(f"Mid360 sensor '{sensor_name}' is required for lidar-derived safety distance.") from exc
++    hit_points_w = sensor.data.ray_hits_w
++    sensor_pos_w = sensor.data.pos_w
++
++    hit_vectors_w = hit_points_w - sensor_pos_w.unsqueeze(1).expand_as(hit_points_w)
++    finite = torch.all(torch.isfinite(hit_vectors_w), dim=-1)
++    base_quat_inv = _quat_conjugate(robot.data.root_quat_w)
++    points_base = _quat_apply(base_quat_inv, hit_vectors_w)
++
++    x = points_base[..., 0]
++    y = points_base[..., 1]
++    z = points_base[..., 2]
++    planar_range = torch.sqrt(torch.clamp(x * x + y * y, min=1.0e-9))
++    theta = torch.atan2(y, x)
++    half_fov = math.radians(horizontal_fov_deg) * 0.5
++
++    valid = (
++        finite
++        & (x >= roi_x_min)
++        & (x <= roi_x_max)
++        & (torch.abs(y) <= roi_abs_y_max)
++        & (z >= roi_z_min)
++        & (z <= roi_z_max)
++        & (planar_range >= min_planar_distance)
++        & (planar_range <= max_distance)
++        & (torch.abs(theta) <= half_fov)
++    )
++
++    masked_range = torch.where(valid, planar_range, torch.full_like(planar_range, float("inf")))
++    nearest_planar, nearest_idx = torch.min(masked_range, dim=1)
++    has_hit = torch.isfinite(nearest_planar)
++
++    env_ids = torch.arange(env.num_envs, device=points_base.device)
++    nearest_xy = points_base[env_ids, nearest_idx, :2]
++    nearest_xy = torch.where(has_hit.unsqueeze(1), nearest_xy, torch.tensor([max_distance, 0.0], device=points_base.device, dtype=points_base.dtype))
++    nearest_norm = torch.linalg.norm(nearest_xy, dim=-1).clamp_min(1.0e-6)
++    directions = nearest_xy / nearest_norm.unsqueeze(-1)
++    distances = torch.clamp(nearest_planar - robot_body_radius, min=0.0, max=max_distance)
++    distances = torch.where(has_hit, distances, torch.full_like(distances, max_distance))
++    return distances, directions
++
++
++def closest_obstacle_raycast(
++    env: ManagerBasedRLEnv,
++    num_rays: int = 9,
++    max_distance: float = 6.0,
++    fov_deg: float = 180.0,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Return closest obstacle distance and corresponding ray direction for each environment."""
++    robot = env.scene["robot"]
++    ray_origins_xy = robot.data.root_pos_w[:, :2]
++    root_yaw = _get_root_yaw(robot.data.root_quat_w)
++    ray_dirs_xy = _build_raycast_dirs(root_yaw, num_rays, fov_deg)
++
++    if not hasattr(env, "obstacle_manager"):
++        distances = torch.full((env.num_envs,), max_distance, device=env.device)
++        default_dirs = ray_dirs_xy[:, num_rays // 2, :]
++        return distances, default_dirs
++
++    obstacle_positions = env.obstacle_manager.get_geometry_proxy_tensor(ray_origins_xy.device)
++    ray_distances, ray_dirs = _raycast_against_cylinders(ray_origins_xy, ray_dirs_xy, obstacle_positions, max_distance)
++
++    closest_distance, ray_indices = torch.min(ray_distances, dim=1)
++    env_ids = torch.arange(env.num_envs, device=env.device)
++    closest_dirs = ray_dirs[env_ids, ray_indices]
++    return closest_distance, closest_dirs
++
++
+ def gait_phase(env: ManagerBasedRLEnv, period: float) -> torch.Tensor:
+     if not hasattr(env, "episode_length_buf"):
+         env.episode_length_buf = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/rewards.py b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/rewards.py
+index 95ddd8a..411b930 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/rewards.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/rewards.py
+@@ -200,11 +200,113 @@ def feet_gait(
+     return reward
+ 
+ 
++"""
++Navigation rewards.
++"""
++
++
++def target_position_distance(
++    env: ManagerBasedRLEnv, command_name: str, threshold: float = 0.5
++) -> torch.Tensor:
++    """Reward for getting closer to target position."""
++    target_pos = env.command_manager.get_command(command_name)
++    robot_pos = env.scene["robot"].data.root_pos_w[:, :2]
++    distance = torch.norm(target_pos - robot_pos, dim=-1)
++    # Reward for being close to target
++    reward = torch.exp(-distance)
++    # Bonus for reaching target
++    reward += (distance < threshold).float() * 10.0
++    return reward
++
++
++def reach_target(
++    env: ManagerBasedRLEnv, command_name: str, threshold: float = 0.5
++) -> torch.Tensor:
++    """Check if robot reached target."""
++    target_pos = env.command_manager.get_command(command_name)
++    robot_pos = env.scene["robot"].data.root_pos_w[:, :2]
++    distance = torch.norm(target_pos - robot_pos, dim=-1)
++    return (distance < threshold).float()
++
++
+ """
+ Other rewards.
+ """
+ 
+ 
++def _closest_obstacle_geometry(env: ManagerBasedRLEnv) -> tuple[torch.Tensor, torch.Tensor]:
++    from unitree_rl_lab.tasks.locomotion import mdp
++
++    return mdp.closest_mid360_obstacle(
++        env,
++        sensor_name="mid360_lidar",
++        max_distance=float(getattr(env.cfg, "lidar_max_distance", 6.0)),
++        horizontal_fov_deg=float(getattr(env.cfg, "compression_fov_deg", 180.0)),
++        roi_x_min=float(getattr(env.cfg, "roi_x_min", -0.5)),
++        roi_x_max=float(getattr(env.cfg, "roi_x_max", 6.0)),
++        roi_abs_y_max=float(getattr(env.cfg, "roi_abs_y_max", 3.0)),
++        roi_z_min=float(getattr(env.cfg, "roi_z_min", -1.0)),
++        roi_z_max=float(getattr(env.cfg, "roi_z_max", 0.8)),
++        min_planar_distance=float(getattr(env.cfg, "min_planar_distance", 0.2)),
++        robot_body_radius=float(getattr(env.cfg, "robot_body_radius", 0.4)),
++    )
++
++
++def proxemic_comfort(
++    env: ManagerBasedRLEnv,
++    comfort_margin: float = 1.2,
++) -> torch.Tensor:
++    """Penalty for getting too close to obstacles outside the hard safety set."""
++    distances, _ = _closest_obstacle_geometry(env)
++    return torch.square(torch.relu(comfort_margin - distances))
++
++
++def safe_approach_velocity(
++    env: ManagerBasedRLEnv,
++    comfort_margin: float = 1.4,
++) -> torch.Tensor:
++    """Penalty for approaching the nearest obstacle too quickly."""
++    distances, directions = _closest_obstacle_geometry(env)
++    robot_vel_xy = env.scene["robot"].data.root_lin_vel_w[:, :2]
++    closing_speed = torch.relu(torch.sum(robot_vel_xy * directions, dim=-1))
++    gate = (distances < comfort_margin).float()
++    return gate * torch.square(closing_speed)
++
++
++def safe_approach_acceleration(
++    env: ManagerBasedRLEnv,
++    comfort_margin: float = 1.4,
++) -> torch.Tensor:
++    """Penalty for increasing closing speed near the nearest obstacle."""
++    distances, directions = _closest_obstacle_geometry(env)
++    robot_vel_xy = env.scene["robot"].data.root_lin_vel_w[:, :2]
++    closing_speed = torch.relu(torch.sum(robot_vel_xy * directions, dim=-1))
++    prev = getattr(env, "_prev_closing_speed", None)
++    if prev is None or prev.shape != closing_speed.shape:
++        prev = torch.zeros_like(closing_speed)
++    dt = float(getattr(env, "step_dt", getattr(env, "sim", None).cfg.dt if hasattr(getattr(env, "sim", None), "cfg") else 0.02))
++    dt = max(dt, 1.0e-3)
++    closing_acc = torch.relu((closing_speed - prev) / dt)
++    env._prev_closing_speed = closing_speed.detach()
++    gate = (distances < comfort_margin).float()
++    return gate * torch.square(closing_acc)
++
++
++def tangential_avoidance(
++    env: ManagerBasedRLEnv,
++    comfort_margin: float = 1.6,
++    command_name: str = "base_velocity",
++) -> torch.Tensor:
++    """Reward tangential motion around nearby obstacles instead of straight-line closing."""
++    distances, directions = _closest_obstacle_geometry(env)
++    robot_vel_xy = env.scene["robot"].data.root_lin_vel_w[:, :2]
++    tangential = robot_vel_xy - torch.sum(robot_vel_xy * directions, dim=-1, keepdim=True) * directions
++    tangential_speed = torch.linalg.norm(tangential, dim=-1)
++    cmd_speed = torch.linalg.norm(env.command_manager.get_command(command_name)[:, :2], dim=-1)
++    gate = ((distances < comfort_margin) & (cmd_speed > 0.1)).float()
++    return gate * torch.tanh(2.0 * tangential_speed)
++
++
+ def joint_mirror(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, mirror_joints: list[list[str]]) -> torch.Tensor:
+     # extract the used quantities (to enable type-hinting)
+     asset: Articulation = env.scene[asset_cfg.name]
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/__init__.py b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/__init__.py
+index e67a144..5855345 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/__init__.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/__init__.py
+@@ -10,3 +10,37 @@ gym.register(
+         "rsl_rl_cfg_entry_point": f"unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerCfg",
+     },
+ )
++
++gym.register(
++    id="Unitree-G1-29dof-Velocity-Obstacles",
++    entry_point="isaaclab.envs:ManagerBasedRLEnv",
++    disable_env_checker=True,
++    kwargs={
++        "env_cfg_entry_point": f"{__name__}.velocity_obstacles_env_cfg:RobotEnvCfg",
++        "play_env_cfg_entry_point": f"{__name__}.velocity_obstacles_env_cfg:RobotPlayEnvCfg",
++        "rsl_rl_cfg_entry_point": f"unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerCfg",
++    },
++)
++
++# Register obstacle avoidance environment with P3O
++gym.register(
++    id="Unitree-G1-29dof-ObstacleAvoidance",
++    entry_point="isaaclab.envs:ManagerBasedRLEnv",
++    disable_env_checker=True,
++    kwargs={
++        "env_cfg_entry_point": f"{__name__}.obstacle_env_cfg:ObstacleAvoidanceEnvCfg",
++        "play_env_cfg_entry_point": f"{__name__}.obstacle_env_cfg:ObstacleAvoidancePlayEnvCfg",
++        "rsl_rl_cfg_entry_point": f"unitree_rl_lab.tasks.locomotion.agents.rsl_rl_p3o_cfg:BaseP3ORunnerCfg",
++    },
++)
++
++gym.register(
++    id="Unitree-G1-29dof-ObstacleAvoidance-realG1",
++    entry_point="isaaclab.envs:ManagerBasedRLEnv",
++    disable_env_checker=True,
++    kwargs={
++        "env_cfg_entry_point": f"{__name__}.realg1_env_cfg:RealG1ObstacleAvoidanceEnvCfg",
++        "play_env_cfg_entry_point": f"{__name__}.realg1_env_cfg:RealG1ObstacleAvoidancePlayEnvCfg",
++        "rsl_rl_cfg_entry_point": f"unitree_rl_lab.tasks.locomotion.agents.rsl_rl_p3o_cfg:BaseP3ORunnerCfg",
++    },
++)
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/velocity_env_cfg.py b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/velocity_env_cfg.py
+index ea9b65b..08ee9d4 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/velocity_env_cfg.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/velocity_env_cfg.py
+@@ -67,10 +67,14 @@ class RobotSceneCfg(InteractiveSceneCfg):
+     # sensors
+     height_scanner = RayCasterCfg(
+         prim_path="{ENV_REGEX_NS}/Robot/torso_link",
+-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
++        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.1)),  # Just above robot
+         ray_alignment="yaw",
+-        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
+-        debug_vis=False,
++        pattern_cfg=patterns.GridPatternCfg(
++            resolution=0.05,  # Dense rays every 5cm
++            size=(2.0, 2.0),  # Small 2m x 2m range around robot
++            direction=(0.0, 0.0, -1.0),  # Point downward
++        ),
++        debug_vis=True,  # Enabled for visualization
+         mesh_prim_paths=["/World/ground"],
+     )
+     contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True)
+@@ -379,7 +383,15 @@ class RobotEnvCfg(ManagerBasedRLEnvCfg):
+         self.sim.dt = 0.005
+         self.sim.render_interval = self.decimation
+         self.sim.physics_material = self.scene.terrain.physics_material
+-        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
++        # Increase PhysX GPU memory for large-scale training (P3O)
++        self.sim.physx.gpu_max_rigid_patch_count = 20 * 2**15  # Increased from 10
++        self.sim.physx.gpu_found_lost_pairs_capacity = 50 * 1024 * 1024  # 50M pairs
++        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 50 * 1024 * 1024
++        self.sim.physx.gpu_total_aggregate_pairs_capacity = 50 * 1024 * 1024
++        self.sim.physx.gpu_max_soft_body_contacts = 10 * 2**15
++        self.sim.physx.gpu_max_partition_iteration_counts = 8192
++        self.sim.physx.gpu_temp_buffer_capacity = 200 * 1024 * 1024  # 200MB temp buffer
++        self.sim.physx.gpu_max_num_partitions = 8
+ 
+         # update sensor update periods
+         # we tick all the sensors based on the smallest update period (physics update period)

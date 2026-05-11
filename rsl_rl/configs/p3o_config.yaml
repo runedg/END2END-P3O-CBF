@@ -1,0 +1,89 @@
+# P3O (Penalized Proximal Policy Optimization) Configuration
+# For Safe Reinforcement Learning in Isaac Lab
+
+# Training parameters
+num_steps_per_env: 24          # Number of steps per environment per update
+max_iterations: 1000           # Maximum number of training iterations
+save_interval: 100             # Save model every N iterations
+
+eval_interval: -1              # Evaluate every N iterations (-1 to disable)
+num_eval_episodes: 10          # Number of evaluation episodes
+
+# Algorithm parameters
+algorithm:
+  class_name: rsl_rl.algorithms.P3O
+  
+  # PPO parameters
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  clip_param: 0.2
+  gamma: 0.99
+  lam: 0.95
+  value_loss_coef: 1.0
+  entropy_coef: 0.01
+  learning_rate: 0.001
+  max_grad_norm: 1.0
+  optimizer: adam
+  use_clipped_value_loss: true
+  schedule: adaptive           # adaptive, fixed
+  desired_kl: 0.01
+  normalize_advantage_per_mini_batch: false
+  
+  # P3O specific parameters (Safe RL)
+  cost_gamma: 0.99             # Discount factor for cost
+  cost_lam: 0.95               # GAE lambda for cost
+  cost_limit: 25.0             # Cost limit (safety constraint)
+  kappa: 1.0                   # Penalty coefficient
+  standardized_cost_adv: false # Whether to standardize cost advantages
+
+# Actor model configuration
+actor:
+  class_name: rsl_rl.models.MLPModel
+  hidden_dims: [256, 256, 256]
+  activation: elu
+  obs_normalization: true
+  distribution_cfg:
+    class_name: rsl_rl.modules.distribution.GaussianDistribution
+    std_init: 1.0
+    std_min: 0.01
+    std_max: 1.0
+
+# Critic model configuration  
+critic:
+  class_name: rsl_rl.models.MLPModel
+  hidden_dims: [256, 256, 256]
+  activation: elu
+  obs_normalization: true
+
+# Cost critic model configuration
+cost_critic:
+  class_name: rsl_rl.models.MLPModel
+  hidden_dims: [256, 256, 256]
+  activation: elu
+  obs_normalization: true
+
+# Observation groups (what each network sees)
+obs_groups:
+  actor: ["base_lin_vel", "base_ang_vel", "projected_gravity", "commands", "joint_pos", "joint_vel", "actions"]
+  critic: ["base_lin_vel", "base_ang_vel", "projected_gravity", "commands", "joint_pos", "joint_vel", "actions"]
+  cost_critic: ["base_lin_vel", "base_ang_vel", "projected_gravity", "commands", "joint_pos", "joint_vel", "actions"]
+
+# RND (optional)
+# rnd_cfg:
+#   learning_rate: 0.001
+#   weight: 0.01
+#   obs_group: rnd_state
+
+# Symmetry (optional)
+# symmetry_cfg:
+#   use_data_augmentation: true
+#   use_mirror_loss: true
+#   mirror_loss_coeff: 1.0
+#   data_augmentation_func: your_module.your_symmetry_function
+
+# Logging
+logger:
+  class_name: rsl_rl.utils.logger.Logger
+  log_dir: logs/p3o
+  use_tensorboard: true
+  use_wandb: false

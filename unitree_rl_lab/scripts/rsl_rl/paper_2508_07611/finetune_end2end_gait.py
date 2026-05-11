@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""Fine-tune end2end P3O-CBF policy for natural gait.
+
+Resumes from an existing realG1 checkpoint, boosts gait quality rewards,
+keeps moderate obstacle difficulty, and uses lower learning rate
+to preserve obstacle avoidance capability.
+
+Uses the SAME task (Unitree-G1-29dof-ObstacleAvoidance-realG1), terrain,
+and Mid360 pointcloud observations as the original curriculum trainer
+so that the checkpoint is loaded with the correct observation layout.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+from datetime import datetime
+
+import torch
+
+from cuda_reduce_workaround import apply_cuda_reduce_workaround
+from isaaclab.app import AppLauncher
+from actor_critic_safe_perception import ActorCriticSafePerception, ObsTermSpec
+
+apply_cuda_reduce_workaround()
+
+# ── argparse (mirrors curriculum trainer defaults) ──────────────────────
+parser = argparse.ArgumentParser(description="Fine-tune end2end P3O-CBF for natural gait.")
+parser.add_argument("--num_envs", type=int, default=4096)
+parser.add_argument("--max_iterations", type=int, default=5000)
+parser.add_argument("--save_interval", type=int, default=500)
+parser.add_argument("--experiment_name", type=str, default="End2EndP3O_GaitFinetune")
+parser.add_argument("--headless", action="store_true", default=False)
+parser.add_argument("--device", type=str, default="cuda:0")
+parser.add_argument("--resume", type=str,
+    default="/home/ubuntu/P3O-CBF/logs/P3O-END2END-001/2026-04-30_06-06-44/model_final.pt")
+parser.add_argument("--num_steps_per_env", type=int, default=24)
+parser.add_argument("--num_learning_epochs", type=int, default=5)
+parser.add_argument("--num_mini_batches", type=int, default=16)
+parser.add_argument("--learning_rate", type=float, default=1e-4)
+parser.add_argument("--cost_critic_learning_rate", type=float, default=3e-5)
+parser.add_argument("--entropy_coef", type=float, default=0.005)
+parser.add_argument("--cost_limit", type=float, default=0.22)
+parser.add_argument("--kappa", type=float, default=1.0)
+parser.add_argument("--cost_gamma", type=float, default=0.99)
+parser.add_argument("--cost_lam", type=float, default=0.95)
+parser.add_argument("--safety_margin", type=float, default=0.8)
+parser.add_argument("--cbf_gamma", type=float, default=0.5)
+parser.add_argument("--collision_distance", type=float, default=0.2)
+parser.add_argument("--unsafe_cost_weight", type=float, default=1.0)
+parser.add_argument("--cbf_cost_weight", type=float, default=1.0)
+parser.add_argument("--collision_cost_weight", type=float, default=2.0)
+parser.add_argument("--contact_cost_weight", type=float, default=4.0)
+parser.add_argument("--contact_force_threshold", type=float, default=1.0)
+parser.add_argument("--num_obstacles", type=int, default=8)
+parser.add_argument("--obstacle_robot_clearance", type=float, default=2.4)
+parser.add_argument("--max_vx", type=float, default=0.45)
+parser.add_argument("--max_vy", type=float, default=0.10)
+parser.add_argument("--max_yaw", type=float, default=0.20)
+parser.add_argument("--omni_pattern_file", type=str,
+    default="/home/ubuntu/P3O-CBF/OmniPerception/LidarSensor/LidarSensor/sensor_pattern/sensor_lidar/scan_mode/mid360.npy")
+parser.add_argument("--history_length", type=int, default=5)
+parser.add_argument("--omni_point_samples", type=int, default=1024)
+parser.add_argument("--num_fps_points", type=int, default=128)
+parser.add_argument("--lidar_max_distance", type=float, default=6.0)
+parser.add_argument("--compression_fov_deg", type=float, default=180.0)
+parser.add_argument("--roi_x_min", type=float, default=-0.5)
+parser.add_argument("--roi_x_max", type=float, default=6.0)
+parser.add_argument("--roi_abs_y_max", type=float, default=3.0)
+parser.add_argument("--roi_z_min", type=float, default=-1.0)
+parser.add_argument("--roi_z_max", type=float, default=0.8)
+parser.add_argument("--min_planar_distance", type=float, default=0.2)
+parser.add_argument("--robot_body_radius", type=float, default=0.4)
+parser.add_argument("--sensor_offset_x", type=float, default=0.10)
+parser.add_argument("--sensor_offset_y", type=float, default=0.0)
+parser.add_argument("--sensor_offset_z", type=float, default=0.63)
+parser.add_argument("--enable_sensor_noise", action="store_true", default=True)
+parser.add_argument("--random_distance_noise", type=float, default=0.02)
+parser.add_argument("--pixel_dropout_prob", type=float, default=0.01)
+parser.add_argument("--sector_dropout_prob", type=float, default=0.10)
+parser.add_argument("--sector_dropout_width_deg", type=float, default=8.0)
+parser.add_argument("--translation_noise_x", type=float, default=0.015)
+parser.add_argument("--translation_noise_y", type=float, default=0.015)
+parser.add_argument("--translation_noise_z", type=float, default=0.015)
+parser.add_argument("--rotation_noise_roll_deg", type=float, default=2.0)
+parser.add_argument("--rotation_noise_pitch_deg", type=float, default=2.0)
+parser.add_argument("--rotation_noise_yaw_deg", type=float, default=2.0)
+
+args_cli = parser.parse_args()
+
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+import gymnasium as gym
+import isaaclab.terrains as terrain_gen
+import isaaclab_tasks  # noqa: F401
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from torch.utils.tensorboard import SummaryWriter
+
+from p3o_cbf_paper import P3OCBFPaper
+
+
+# ── helpers (same as curriculum trainer) ────────────────────────────────
+
+def _closest_obstacle_geometry(env):
+    from unitree_rl_lab.tasks.locomotion import mdp
+    return mdp.closest_mid360_obstacle(
+        env, sensor_name="mid360_lidar",
+        max_distance=args_cli.lidar_max_distance,
+        horizontal_fov_deg=args_cli.compression_fov_deg,
+        roi_x_min=args_cli.roi_x_min, roi_x_max=args_cli.roi_x_max,
+        roi_abs_y_max=args_cli.roi_abs_y_max,
+        roi_z_min=args_cli.roi_z_min, roi_z_max=args_cli.roi_z_max,
+        min_planar_distance=args_cli.min_planar_distance,
+        robot_body_radius=args_cli.robot_body_radius,
+    )
+
+
+def _non_foot_contact_cost(env, threshold):
+    contact_sensor = env.scene.sensors["contact_forces"]
+    force_norm = torch.linalg.norm(contact_sensor.data.net_forces_w, dim=-1)
+    body_names = contact_sensor.body_names
+    non_foot_ids = [i for i, n in enumerate(body_names) if "ankle" not in n]
+    if not non_foot_ids:
+        return torch.zeros(env.num_envs, device=env.device)
+    body_ids = torch.tensor(non_foot_ids, device=env.device, dtype=torch.long)
+    return torch.any(force_norm[:, body_ids] > threshold, dim=1).float()
+
+
+def compute_paper_cost(env, cfg):
+    robot = env.scene["robot"]
+    robot_vel_xy = robot.data.root_lin_vel_w[:, :2]
+    distances, directions = _closest_obstacle_geometry(env)
+    h = distances - cfg.safety_margin
+    h_dot = -torch.sum(robot_vel_xy * directions, dim=-1)
+    dt = float(env.cfg.decimation * env.cfg.sim.dt)
+    h_next_est = h + dt * h_dot
+    cbf_margin = h_next_est - (1.0 - cfg.cbf_gamma) * h
+    cbf_violation = torch.relu(-cbf_margin)
+    unsafe_cost = (distances < cfg.safety_margin).float()
+    collision_cost = (distances < cfg.collision_distance).float()
+    contact_cost = _non_foot_contact_cost(env, cfg.contact_force_threshold)
+    total_cost = (
+        cfg.unsafe_cost_weight * unsafe_cost
+        + cfg.cbf_cost_weight * cbf_violation
+        + cfg.collision_cost_weight * collision_cost
+        + cfg.contact_cost_weight * contact_cost
+    )
+    info = {
+        "paper/distance_mean": distances.mean().item(),
+        "paper/distance_min": distances.min().item(),
+        "paper/cbf_violation_rate": (cbf_violation > 0).float().mean().item(),
+        "paper/unsafe_rate": unsafe_cost.mean().item(),
+        "paper/collision_rate": collision_cost.mean().item(),
+        "paper/contact_rate": contact_cost.mean().item(),
+    }
+    return total_cost, info
+
+
+def compute_tracking_metrics(env):
+    from unitree_rl_lab.tasks.locomotion import mdp
+    robot = env.scene["robot"]
+    command = mdp.generated_commands(env, command_name="base_velocity")
+    actual_lin = robot.data.root_lin_vel_b[:, :2]
+    cmd_lin = command[:, :2]
+    return {
+        "track/lin_error": torch.linalg.norm(actual_lin - cmd_lin, dim=-1).mean().item(),
+        "track/actual_speed": torch.linalg.norm(actual_lin, dim=-1).mean().item(),
+        "track/command_speed": torch.linalg.norm(cmd_lin, dim=-1).mean().item(),
+    }
+
+
+def build_actor_term_specs(hl, np):
+    return [
+        ObsTermSpec("base_ang_vel", 3, hl), ObsTermSpec("projected_gravity", 3, hl),
+        ObsTermSpec("velocity_commands", 3, hl), ObsTermSpec("lidar_points", np * 3, hl),
+        ObsTermSpec("joint_pos_rel", 29, hl), ObsTermSpec("joint_vel_rel", 29, hl),
+        ObsTermSpec("last_action", 29, hl),
+    ]
+
+def build_critic_term_specs(hl, np):
+    return [
+        ObsTermSpec("base_lin_vel", 3, hl), ObsTermSpec("base_ang_vel", 3, hl),
+        ObsTermSpec("projected_gravity", 3, hl), ObsTermSpec("velocity_commands", 3, hl),
+        ObsTermSpec("lidar_points", np * 3, hl), ObsTermSpec("joint_pos_rel", 29, hl),
+        ObsTermSpec("joint_vel_rel", 29, hl), ObsTermSpec("last_action", 29, hl),
+    ]
+
+
+# ── main ────────────────────────────────────────────────────────────────
+
+def main():
+    import unitree_rl_lab.tasks  # noqa: F401
+    from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
+    from unitree_rl_lab.tasks.locomotion.obstacle_manager import ObstacleManager
+
+    # 1) Load the SAME task as the curriculum trainer
+    task_name = "Unitree-G1-29dof-ObstacleAvoidance-realG1"
+    env_cfg = load_cfg_from_registry(task_name, "env_cfg_entry_point")
+    env_cfg.scene.num_envs = args_cli.num_envs
+    env_cfg.sim.device = args_cli.device
+    env_cfg.safety_margin = args_cli.safety_margin
+    env_cfg.cbf_gamma = args_cli.cbf_gamma
+    env_cfg.collision_distance = args_cli.collision_distance
+
+    # 2) Configure terrain with MeshClutterPillars (same as curriculum trainer)
+    obstacle_env_cfg_mod = __import__(
+        "unitree_rl_lab.tasks.locomotion.robots.g1.29dof.obstacle_env_cfg",
+        fromlist=["MeshClutterPillarsTerrainCfg"],
+    )
+    MeshClutterPillarsTerrainCfg = obstacle_env_cfg_mod.MeshClutterPillarsTerrainCfg
+
+    terrain_rows = int(math.ceil(math.sqrt(args_cli.num_envs)))
+    terrain_cols = int(math.ceil(args_cli.num_envs / terrain_rows))
+    env_cfg.scene.env_spacing = max(env_cfg.scene.env_spacing, 20.0)
+    env_cfg.scene.terrain.max_init_terrain_level = terrain_rows - 1
+    env_cfg.scene.terrain.terrain_generator = terrain_gen.TerrainGeneratorCfg(
+        size=(30.0, 24.0),
+        border_width=0.0,
+        num_rows=terrain_rows,
+        num_cols=terrain_cols,
+        horizontal_scale=0.1,
+        vertical_scale=0.005,
+        slope_threshold=0.75,
+        difficulty_range=(0.0, 0.0),
+        use_cache=False,
+        sub_terrains={
+            "clutter_pillars": MeshClutterPillarsTerrainCfg(
+                proportion=1.0,
+                num_obstacles=args_cli.num_obstacles,
+                radius=env_cfg.obstacle_radius,
+                height=env_cfg.obstacle_height,
+                x_range=(-10.5, 10.5),
+                y_range=(-8.5, 8.5),
+                layout_variant="continuous_avoidance",
+            ),
+        },
+    )
+    env_cfg.min_obstacle_distance = 1.7
+    env_cfg.num_obstacles = args_cli.num_obstacles
+    env_cfg.obstacle_layout_mode = "clutter"
+    env_cfg.obstacle_layout_variant = "continuous_avoidance"
+    env_cfg.obstacle_x_range = (-10.5, 10.5)
+    env_cfg.obstacle_y_range = (-8.5, 8.5)
+    env_cfg.obstacle_min_gap = 1.35
+    env_cfg.obstacle_robot_clearance = args_cli.obstacle_robot_clearance
+    env_cfg.obstacle_collision_mode = "terrain_mesh"
+    env_cfg.lidar_max_distance = args_cli.lidar_max_distance
+    env_cfg.compression_fov_deg = args_cli.compression_fov_deg
+    env_cfg.roi_x_min = args_cli.roi_x_min
+    env_cfg.roi_x_max = args_cli.roi_x_max
+    env_cfg.roi_abs_y_max = args_cli.roi_abs_y_max
+    env_cfg.roi_z_min = args_cli.roi_z_min
+    env_cfg.roi_z_max = args_cli.roi_z_max
+    env_cfg.min_planar_distance = args_cli.min_planar_distance
+    env_cfg.robot_body_radius = args_cli.robot_body_radius
+
+    # 3) Override pointcloud observations (same as curriculum trainer)
+    from unitree_rl_lab.tasks.locomotion import mdp
+    pc_params = {
+        "pattern_file": args_cli.omni_pattern_file,
+        "samples": args_cli.omni_point_samples,
+        "num_fps_points": args_cli.num_fps_points,
+        "max_distance": args_cli.lidar_max_distance,
+        "sensor_offset": (args_cli.sensor_offset_x, args_cli.sensor_offset_y, args_cli.sensor_offset_z),
+        "horizontal_fov_deg": args_cli.compression_fov_deg,
+        "roi_x_min": args_cli.roi_x_min, "roi_x_max": args_cli.roi_x_max,
+        "roi_abs_y_max": args_cli.roi_abs_y_max,
+        "roi_z_min": args_cli.roi_z_min, "roi_z_max": args_cli.roi_z_max,
+        "min_planar_distance": args_cli.min_planar_distance,
+        "enable_sensor_noise": args_cli.enable_sensor_noise,
+        "random_distance_noise": args_cli.random_distance_noise,
+        "pixel_dropout_prob": args_cli.pixel_dropout_prob,
+        "sector_dropout_prob": args_cli.sector_dropout_prob,
+        "sector_dropout_width_deg": args_cli.sector_dropout_width_deg,
+        "random_translation_range": (args_cli.translation_noise_x, args_cli.translation_noise_y, args_cli.translation_noise_z),
+        "random_rotation_deg_range": (args_cli.rotation_noise_roll_deg, args_cli.rotation_noise_pitch_deg, args_cli.rotation_noise_yaw_deg),
+    }
+    point_dim = args_cli.num_fps_points * 3
+    scale = tuple([1.0 / args_cli.lidar_max_distance] * point_dim)
+
+    env_cfg.observations.policy.obstacle_scan = ObsTerm(
+        func=mdp.omni_lidar_realg1_pointcloud_fps,
+        params=pc_params,
+        clip=(-args_cli.lidar_max_distance, args_cli.lidar_max_distance),
+        scale=scale,
+    )
+    env_cfg.observations.policy.history_length = args_cli.history_length
+
+    env_cfg.observations.critic.obstacle_scan = ObsTerm(
+        func=mdp.omni_lidar_realg1_pointcloud_fps,
+        params=pc_params,
+        clip=(-args_cli.lidar_max_distance, args_cli.lidar_max_distance),
+        scale=scale,
+    )
+    env_cfg.observations.critic.history_length = args_cli.history_length
+
+    # 4) Boost gait quality rewards
+    env_cfg.rewards.alive.weight = 0.30
+    env_cfg.rewards.base_height.weight = -12.0
+    env_cfg.rewards.flat_orientation_l2.weight = -5.0
+    env_cfg.rewards.action_rate.weight = -0.08
+    env_cfg.rewards.joint_vel.weight = -0.001
+    env_cfg.rewards.energy.weight = -3.0e-5
+    env_cfg.rewards.joint_deviation_waists.weight = -1.5
+    env_cfg.rewards.joint_deviation_legs.weight = -1.2
+    env_cfg.rewards.gait.weight = 0.80
+    env_cfg.rewards.feet_slide.weight = -0.15
+    env_cfg.rewards.feet_clearance.weight = 1.5
+    env_cfg.rewards.undesired_contacts.weight = -0.8
+    env_cfg.rewards.track_lin_vel_xy.weight = 2.0
+    env_cfg.rewards.track_ang_vel_z.weight = 1.0
+
+    # 5) Command range for natural gait
+    cmd_cfg = env_cfg.commands.base_velocity
+    cmd_cfg.rel_standing_envs = 0.05
+    cmd_cfg.ranges.lin_vel_x = (0.10, args_cli.max_vx)
+    cmd_cfg.ranges.lin_vel_y = (-args_cli.max_vy, args_cli.max_vy)
+    cmd_cfg.ranges.ang_vel_z = (-args_cli.max_yaw, args_cli.max_yaw)
+
+    # 6) Build environment
+    env = gym.make(task_name, cfg=env_cfg)
+    env = env.unwrapped
+    env.obstacle_manager = ObstacleManager(env, env.cfg)
+    env.obstacle_manager.spawn_obstacles()
+
+    obs_dict = env.reset()
+    if isinstance(obs_dict, tuple):
+        obs_dict = obs_dict[0]
+
+    # 7) Build policy from checkpoint
+    device = args_cli.device
+    num_envs = env.num_envs
+    num_steps_per_env = args_cli.num_steps_per_env
+    history_length = args_cli.history_length
+    num_fps_points = args_cli.num_fps_points
+
+    policy = ActorCriticSafePerception(
+        actor_term_specs=build_actor_term_specs(history_length, num_fps_points),
+        critic_term_specs=build_critic_term_specs(history_length, num_fps_points),
+        num_actions=env.action_space.shape[-1],
+        actor_hidden_dims=[256, 128],
+        critic_hidden_dims=[256, 128],
+        activation="elu",
+        init_noise_std=0.5,
+        proprio_hidden_dim=128,
+        scan_hidden_dim=64,
+        rnn_hidden_dim=64,
+    ).to(device)
+
+    checkpoint = torch.load(args_cli.resume, map_location=device, weights_only=False)
+    policy.load_state_dict(checkpoint["policy_state_dict"], strict=True)
+    print(f"[INFO] Loaded checkpoint from {args_cli.resume}")
+
+    # 8) Build P3O algorithm
+    alg = P3OCBFPaper(
+        actor_critic=policy,
+        num_learning_epochs=args_cli.num_learning_epochs,
+        num_mini_batches=args_cli.num_mini_batches,
+        clip_param=0.2,
+        gamma=0.99,
+        lam=0.95,
+        cost_gamma=args_cli.cost_gamma,
+        cost_lam=args_cli.cost_lam,
+        value_loss_coef=1.0,
+        entropy_coef=args_cli.entropy_coef,
+        learning_rate=args_cli.learning_rate,
+        cost_critic_learning_rate=args_cli.cost_critic_learning_rate,
+        max_grad_norm=1.0,
+        use_clipped_value_loss=True,
+        schedule="adaptive",
+        desired_kl=0.008,
+        device=device,
+        cost_limit=args_cli.cost_limit,
+        kappa=args_cli.kappa,
+    )
+    # Restore optimizer state
+    if "optimizer_state_dict" in checkpoint:
+        try:
+            alg.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            print("[INFO] Restored optimizer state")
+        except Exception:
+            print("[WARN] Could not restore optimizer, using fresh")
+    if "cost_optimizer_state_dict" in checkpoint:
+        try:
+            alg.cost_value_optimizer.load_state_dict(checkpoint["cost_optimizer_state_dict"])
+            print("[INFO] Restored cost optimizer state")
+        except Exception:
+            print("[WARN] Could not restore cost optimizer, using fresh")
+
+    alg.init_storage(num_envs, num_steps_per_env,
+                     [obs_dict["policy"].shape[-1]],
+                     [obs_dict["critic"].shape[-1]],
+                     [env.action_space.shape[-1]])
+
+    # 9) Logging
+    log_dir = os.path.join("/home/ubuntu/P3O-CBF/logs", args_cli.experiment_name,
+                           datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    os.makedirs(log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=log_dir, flush_secs=10)
+    print(f"[INFO] log_dir={log_dir}")
+    print(f"[INFO] Gait finetune: lr={args_cli.learning_rate} obstacles={args_cli.num_obstacles}")
+    print(f"[INFO] Boosted rewards: gait=0.80, feet_clearance=1.5, action_rate=-0.08, base_height=-12.0")
+
+    # 10) Training loop
+    for iteration in range(args_cli.max_iterations):
+        episode_reward = torch.zeros(num_envs, device=device)
+        episode_cost = torch.zeros(num_envs, device=device)
+        paper_info_acc = {}
+        tracking_info_acc = {}
+
+        for _ in range(num_steps_per_env):
+            obs = obs_dict["policy"].to(device)
+            critic_obs = obs_dict["critic"].to(device)
+            with torch.no_grad():
+                actions = alg.act(obs, critic_obs)
+
+            step_result = env.step(actions)
+            if len(step_result) == 5:
+                obs_dict, rewards, terminated, truncated, infos = step_result
+                dones = torch.logical_or(terminated, truncated).to(device)
+            else:
+                obs_dict, rewards, dones, infos = step_result
+                dones = dones.to(device)
+
+            costs, paper_info = compute_paper_cost(env, args_cli)
+            track_info = compute_tracking_metrics(env)
+
+            episode_reward += rewards.to(device)
+            episode_cost += costs
+            for k, v in paper_info.items():
+                paper_info_acc.setdefault(k, 0.0)
+                paper_info_acc[k] += v
+            for k, v in track_info.items():
+                tracking_info_acc.setdefault(k, 0.0)
+                tracking_info_acc[k] += v
+            alg.process_env_step(rewards.to(device), costs, dones, infos)
+
+        with torch.no_grad():
+            alg.compute_returns(obs_dict["critic"].to(device))
+
+        losses = alg.update()
+        reward_mean = episode_reward.mean().item() / num_steps_per_env
+        cost_mean = episode_cost.mean().item() / num_steps_per_env
+
+        writer.add_scalar("train/reward", reward_mean, iteration)
+        writer.add_scalar("train/cost", cost_mean, iteration)
+        for k, v in losses.items():
+            writer.add_scalar(f"loss/{k}", v, iteration)
+        for k, v in paper_info_acc.items():
+            writer.add_scalar(k, v / num_steps_per_env, iteration)
+        for k, v in tracking_info_acc.items():
+            writer.add_scalar(k, v / num_steps_per_env, iteration)
+
+        if (iteration + 1) % 20 == 0 or iteration == 0:
+            print(
+                f"[ITER {iteration+1:05d}] "
+                f"reward={reward_mean:.4f} cost={cost_mean:.4f} "
+                f"unsafe={paper_info_acc.get('paper/unsafe_rate',0)/num_steps_per_env:.4f} "
+                f"collision={paper_info_acc.get('paper/collision_rate',0)/num_steps_per_env:.4f} "
+                f"contact={paper_info_acc.get('paper/contact_rate',0)/num_steps_per_env:.4f} "
+                f"speed={tracking_info_acc.get('track/actual_speed',0)/num_steps_per_env:.3f}"
+            )
+
+        if (iteration + 1) % args_cli.save_interval == 0:
+            torch.save({
+                "iteration": iteration + 1,
+                "policy_state_dict": policy.state_dict(),
+                "optimizer_state_dict": alg.optimizer.state_dict(),
+                "cost_optimizer_state_dict": alg.cost_value_optimizer.state_dict(),
+                "args": vars(args_cli),
+            }, os.path.join(log_dir, f"model_{iteration+1}.pt"))
+
+    torch.save({
+        "iteration": args_cli.max_iterations,
+        "policy_state_dict": policy.state_dict(),
+        "optimizer_state_dict": alg.optimizer.state_dict(),
+        "cost_optimizer_state_dict": alg.cost_value_optimizer.state_dict(),
+        "args": vars(args_cli),
+    }, os.path.join(log_dir, "model_final.pt"))
+    print(f"[INFO] Final model saved to {log_dir}/model_final.pt")
+    writer.close()
+    env.close()
+    simulation_app.close()
+
+if __name__ == "__main__":
+    main()

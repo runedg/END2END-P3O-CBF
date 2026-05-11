@@ -1,0 +1,1 @@
+/home/ubuntu/P3O-CBF/logs/p3o_g1_cbf_paper_avoid/2026-04-14_10-18-02/model_final.pt
