@@ -115,7 +115,3 @@ python rl_sar/policy/g1/p3o_end2end/export_model_libtorch23.py
 | `dt` | 0.005 × 4 decimation = 0.02s |
 | 训练框架 | rsl_rl + IsaacLab |
 
----
-
-**备份日期**：2026-05-11  
-**原始路径**：`/home/ubuntu/P3O-CBF`
